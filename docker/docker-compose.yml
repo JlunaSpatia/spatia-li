@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   db:
     image: postgis/postgis:16-3.4
@@ -17,8 +15,9 @@ services:
   pgadmin:
     image: dpage/pgadmin4
     container_name: spatia_pgadmin
+    restart: always
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@spatia.local
+      PGADMIN_DEFAULT_EMAIL: jluna@spatiaconsulting.com
       PGADMIN_DEFAULT_PASSWORD: admin123
     ports:
       - "8080:80"
@@ -28,6 +27,8 @@ services:
   osrm:
     image: osrm/osrm-backend
     container_name: spatia_osrm
+    depends_on:
+      - db
     command: osrm-routed /data/madrid.osrm
     ports:
       - "5000:5000"

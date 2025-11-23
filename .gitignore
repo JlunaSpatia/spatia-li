@@ -205,3 +205,20 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# -----------------------
+# GeoData files to ignore
+# -----------------------
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.qpj
+*.geojson
+*.gpkg
+*.pbf
+*.zip
+data/raw/
+data/processed/
