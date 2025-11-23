@@ -1,0 +1,38 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: spatia_postgis
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: spatia
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: spatia_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@spatia.local
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+
+  osrm:
+    image: osrm/osrm-backend
+    container_name: spatia_osrm
+    command: osrm-routed /data/madrid.osrm
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./osrm_data:/data
+
+volumes:
+  pgdata:
