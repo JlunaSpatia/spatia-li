@@ -25,15 +25,23 @@ services:
       - db
 
   osrm:
-    image: osrm/osrm-backend
+    image: osrm/osrm-backend:latest
     container_name: spatia_osrm
-    depends_on:
-      - db
-    command: osrm-routed /data/madrid.osrm
-    ports:
-      - "5000:5000"
+    working_dir: /data
     volumes:
       - ./osrm_data:/data
+    command: >
+      bash -c "
+      osrm-extract -p /opt/car.lua /data/madrid.osm.pbf &&
+      osrm-partition /data/madrid.osrm &&
+      osrm-customize /data/madrid.osrm &&
+      osrm-routed --algorithm mld /data/madrid.osrm
+      "
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+    depends_on:
+      - db
 
 volumes:
   pgdata:

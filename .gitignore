@@ -222,3 +222,14 @@ __marimo__/
 *.zip
 data/raw/
 data/processed/
+
+
+# -----------------------
+# OSRM Data and generated files
+# -----------------------
+# Ignora la carpeta de datos procesados por Docker/OSRM
+osrm_data/
+
+# Ignora todos los archivos procesados por OSRM
+*.osrm
+*.osrm.*
