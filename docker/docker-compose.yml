@@ -1,4 +1,7 @@
+version: '3.8'
+
 services:
+  # --- BASE DE DATOS GEESPACIAL ---
   db:
     image: postgis/postgis:16-3.4
     container_name: spatia_postgis
@@ -12,6 +15,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  # --- GESTOR DE BASE DE DATOS (GUI) ---
   pgadmin:
     image: dpage/pgadmin4
     container_name: spatia_pgadmin
@@ -24,30 +28,31 @@ services:
     depends_on:
       - db
 
-  osrm:
+  # --- MOTOR 1: COCHE (Puerto 5000) ---
+  osrm-drive:
     image: osrm/osrm-backend:latest
-    container_name: spatia_osrm
+    container_name: spatia_osrm_drive
     restart: unless-stopped
-    working_dir: /data
     volumes:
-      - /home/jesus/spatia-li/docker/osrm_data:/data
+      # Montamos solo la carpeta de coche procesada
+      - ./osrm_data/car:/data
     ports:
       - "5000:5000"
-    command: >
-      sh -c "
-      echo 'Verificando archivos...' &&
-      ls -la /data/ &&
-      if [ ! -f /data/madrid.osm.pbf ]; then
-        echo 'ERROR: No se encuentra /data/madrid.osm.pbf' &&
-        exit 1
-      fi &&
-      echo 'Archivo .pbf encontrado. Procesando...' &&
-      osrm-extract -p /opt/car.lua /data/madrid.osm.pbf &&
-      osrm-partition /data/madrid.osrm &&
-      osrm-customize /data/madrid.osrm &&
-      echo 'Iniciando servidor OSRM...' &&
-      osrm-routed --algorithm mld /data/madrid.osrm
-      "
+    # Arranca el servidor usando el archivo que generamos manualmente
+    command: "osrm-routed --algorithm mld /data/input.osrm"
+
+  # --- MOTOR 2: PIE (Puerto 5001) ---
+  osrm-walk:
+    image: osrm/osrm-backend:latest
+    container_name: spatia_osrm_walk
+    restart: unless-stopped
+    volumes:
+      # Montamos solo la carpeta de pie procesada
+      - ./osrm_data/foot:/data
+    ports:
+      - "5001:5000" # Mapeamos puerto 5000 interno al 5001 de tu PC
+    # Arranca el servidor usando el archivo que generamos manualmente
+    command: "osrm-routed --algorithm mld /data/input.osrm"
 
 volumes:
   pgdata:

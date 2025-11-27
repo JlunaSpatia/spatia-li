@@ -233,3 +233,16 @@ osrm_data/
 # Ignora todos los archivos procesados por OSRM
 *.osrm
 *.osrm.*
+
+# Ignorar todos los archivos JSON que parezcan caché
+*.cache.json
+temp_*.json
+
+# Ignorar archivos que empiecen por "changes" y sean .json
+changes*.json
+
+# Si tienes una carpeta específica donde se guardan, es mejor ignorar la carpeta entera:
+/cache/
+/tmp/
+
+# PRECAUCIÓN: No uses *.json solo, o ignorarás archivos importantes como package.json
