@@ -27,21 +27,28 @@ services:
   osrm:
     image: osrm/osrm-backend:latest
     container_name: spatia_osrm
+    restart: unless-stopped
     working_dir: /data
     volumes:
-      - ./osrm_data:/data
+      - /home/jesus/spatia-li/docker/osrm_data:/data
+    ports:
+      - "5000:5000"
     command: >
-      bash -c "
+      sh -c "
+      echo 'Verificando archivos...' &&
+      ls -la /data/ &&
+      if [ ! -f /data/madrid.osm.pbf ]; then
+        echo 'ERROR: No se encuentra /data/madrid.osm.pbf' &&
+        exit 1
+      fi &&
+      echo 'Archivo .pbf encontrado. Procesando...' &&
       osrm-extract -p /opt/car.lua /data/madrid.osm.pbf &&
       osrm-partition /data/madrid.osrm &&
       osrm-customize /data/madrid.osrm &&
+      echo 'Iniciando servidor OSRM...' &&
       osrm-routed --algorithm mld /data/madrid.osrm
       "
-    ports:
-      - "5000:5000"
-    restart: unless-stopped
-    depends_on:
-      - db
 
 volumes:
   pgdata:
+    driver: local
