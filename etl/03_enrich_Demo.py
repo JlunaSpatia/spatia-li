@@ -27,16 +27,15 @@ def clean_ine_csv(path):
         df = pd.read_csv(path, sep=';', encoding='utf-8', dtype=str)
         df.columns = df.columns.str.strip() # Limpiar nombres de columnas
         
-        # 2. FILTROS ESTRICTOS (Tu corrección)
-        # Eliminamos filas sin sección (totales municipales)
+        # 2. FILTROS ESTRICTOS
+        # Eliminamos filas sin sección
         df = df[df['Secciones'].notna()]
         
         # A. FILTRO INDICADOR: "Renta bruta media por hogar"
-        # Usamos contains para evitar problemas con espacios extra, pero buscamos la frase exacta
         target_indicator = "Renta bruta media por hogar"
         mask_indicador = df['Indicadores de renta media y mediana'].str.contains(target_indicator, case=False, na=False)
         
-        # B. FILTRO PERIODO: Año más reciente (Debería ser 2023 si está en el archivo)
+        # B. FILTRO PERIODO: Año más reciente
         periodos = pd.to_numeric(df['Periodo'], errors='coerce')
         target_year = periodos.max()
         mask_periodo = periodos == target_year
@@ -48,13 +47,10 @@ def clean_ine_csv(path):
         print(f"      -> Datos encontrados: {len(df_clean)} secciones")
 
         if df_clean.empty:
-            print("      ⚠️ AVISO: No se han encontrado datos con esos filtros. Revisa el nombre del indicador en el CSV.")
-            # Debug: Mostrar qué indicadores existen
-            print(f"      Indicadores disponibles: {df['Indicadores de renta media y mediana'].unique()[:3]}")
+            print("      ⚠️ AVISO: No se han encontrado datos. Revisa el CSV.")
             return pd.DataFrame()
 
-        # 3. LIMPIEZA DE VALORES (Columna 'Total')
-        # Formato "34.500" -> 34500.0
+        # 3. LIMPIEZA DE VALORES
         def clean_currency(x):
             if pd.isna(x): return 0.0
             clean_str = str(x).replace('.', '').replace(',', '.')
@@ -65,8 +61,7 @@ def clean_ine_csv(path):
 
         df_clean['renta'] = df_clean['Total'].apply(clean_currency)
         
-        # 4. LIMPIEZA DE CÓDIGO (CUSEC - Primeros 10 dígitos)
-        # Ejemplo: "2800201001 Sección 1" -> "2800201001"
+        # 4. LIMPIEZA DE CÓDIGO (CUSEC - 10 dígitos)
         df_clean['CUSEC'] = df_clean['Secciones'].astype(str).str[:10]
         
         # Eliminar rentas 0
@@ -127,12 +122,9 @@ def enrich_demographics():
     # 3. JOIN
     print("   🔗 Uniendo Datos + Mapa...")
     gdf_census_full = gdf_mapa.merge(df_renta_total, on='CUSEC', how='inner')
-    print(f"      -> Secciones listas para cruce: {len(gdf_census_full)}")
+    print(f"      -> Secciones con datos geográficos: {len(gdf_census_full)}")
     
     if len(gdf_census_full) == 0:
-        print("⚠️ ERROR DE CRUCE: 0 coincidencias. Revisa los códigos CUSEC.")
-        print(f"   Ejemplo Mapa: '{gdf_mapa['CUSEC'].iloc[0]}'")
-        print(f"   Ejemplo CSV:  '{df_renta_total['CUSEC'].iloc[0]}'")
         return
 
     # 4. CARGAR HEXÁGONOS
@@ -143,18 +135,38 @@ def enrich_demographics():
     # 5. INTERPOLACIÓN
     df_income_final = spatial_interpolation(gdf_hex, gdf_census_full, 'renta')
     
-    # 6. GUARDAR (UPDATE)
+    # 6. GUARDAR (CREAR O ACTUALIZAR)
     print("💾 Guardando Renta en BBDD...")
+    
+    # Subir datos nuevos a una tabla temporal
     df_income_final.to_sql('temp_income', engine, if_exists='replace', index=False)
     
     with engine.connect() as conn:
+        # A. Inicializar tabla 'retail_hexagons_enriched' si no existe
+        # La creamos como una copia exacta de la tabla base 'retail_hexagons'
+        print("      -> Verificando tabla destino...")
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS retail_hexagons_enriched AS 
+            SELECT * FROM retail_hexagons;
+        """))
+        
+        # B. Asegurar que la columna 'avg_income' existe
         conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS avg_income FLOAT;"))
+        
+        # C. Crear índice para que el update sea rápido
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_enriched_h3 ON retail_hexagons_enriched(h3_index);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_temp_income_h3 ON temp_income(h3_index);"))
+
+        # D. Update masivo usando la tabla temporal
+        print("      -> Ejecutando UPDATE SQL...")
         conn.execute(text("""
             UPDATE retail_hexagons_enriched AS m
             SET avg_income = s.avg_income
             FROM temp_income AS s
             WHERE m.h3_index = s.h3_index;
         """))
+        
+        # E. Limpieza
         conn.execute(text("DROP TABLE temp_income;"))
         conn.commit()
         
