@@ -14,20 +14,23 @@ def apply_smoothing():
 
     # 1. LEER DATOS COMPLETOS
     print("   Leyendo tabla enriquecida...")
-    # Traemos las 3 variables clave que hemos generado
-    sql = "SELECT h3_index, pop_2025, avg_income, gravity_score FROM retail_hexagons_enriched"
+    # Solo traemos lo que existe: Renta y Población Target
+    # Coalesce(0) para evitar nulos que rompen las sumas
+    sql = """
+    SELECT 
+        h3_index, 
+        COALESCE(target_pop, 0) as target_pop, 
+        COALESCE(avg_income, 0) as avg_income 
+    FROM retail_hexagons_enriched
+    """
     df = pd.read_sql(sql, engine)
     
-    # Rellenar nulos con 0 para poder sumar
-    df = df.fillna(0)
-    
     # Crear diccionarios para búsqueda ultrarrápida
-    pop_dict = df.set_index('h3_index')['pop_2025'].to_dict()
+    pop_dict = df.set_index('h3_index')['target_pop'].to_dict()
     inc_dict = df.set_index('h3_index')['avg_income'].to_dict()
-    grav_dict = df.set_index('h3_index')['gravity_score'].to_dict()
     
     # 2. ALGORITMO DE SUAVIZADO (K-RING)
-    print("   Calculando promedios vecinales (esto tarda un pelín)...")
+    print("   Calculando promedios vecinales...")
     
     results = []
     total = len(df)
@@ -40,25 +43,28 @@ def apply_smoothing():
         # Variables acumuladores
         sum_pop = 0
         sum_inc = 0
-        sum_grav = 0
-        count = 0
+        count_inc = 0
         
         for n in neighbors:
             if n in pop_dict: # Solo si el vecino existe en nuestros datos
+                # Lógica de Negocio:
+                # Población: SUMA (Catchment Area) -> Cuanta más gente alrededor, mejor.
                 sum_pop += pop_dict[n]
-                sum_inc += inc_dict[n]
-                sum_grav += grav_dict[n]
-                count += 1
+                
+                # Renta: PROMEDIO (Average) -> Solo sumamos si tiene dato (>0) para no diluir con parques
+                val_inc = inc_dict[n]
+                if val_inc > 0:
+                    sum_inc += val_inc
+                    count_inc += 1
         
-        # Lógica de Negocio:
-        # Población y Gravedad: SUMA (Catchment Area) -> Cuanta más gente alrededor, mejor.
-        # Renta: PROMEDIO (Average) -> Que vivas al lado de ricos te hace zona rica.
+        # Calculamos finales
+        final_pop = sum_pop # Catchment acumulado
+        final_inc = sum_inc / count_inc if count_inc > 0 else 0 # Renta media de la zona
         
         results.append({
             'h3_index': h3_ix,
-            'pop_smooth': sum_pop,           # Suma del vecindario
-            'gravity_smooth': sum_grav,      # Suma del vecindario
-            'income_smooth': sum_inc / count if count > 0 else 0 # Promedio del vecindario
+            'target_pop_smooth': final_pop,
+            'income_smooth': final_inc
         })
 
     df_smooth = pd.DataFrame(results)
@@ -70,15 +76,13 @@ def apply_smoothing():
     
     with engine.connect() as conn:
         # Crear columnas
-        conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS pop_smooth FLOAT;"))
-        conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS gravity_smooth FLOAT;"))
+        conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS target_pop_smooth FLOAT;"))
         conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS income_smooth FLOAT;"))
         
-        # Update
+        # Update masivo
         conn.execute(text("""
             UPDATE retail_hexagons_enriched AS m
-            SET pop_smooth = s.pop_smooth,
-                gravity_smooth = s.gravity_smooth,
+            SET target_pop_smooth = s.target_pop_smooth,
                 income_smooth = s.income_smooth
             FROM temp_smooth AS s
             WHERE m.h3_index = s.h3_index;
