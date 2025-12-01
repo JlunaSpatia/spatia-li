@@ -8,81 +8,94 @@ import warnings
 DB_URL = "postgresql://postgres:postgres@localhost:5432/spatia"
 warnings.filterwarnings("ignore")
 
-def apply_smoothing():
-    print("🔄 PASO 05: SUAVIZADO ESPACIAL (CONTEXTO K-RING)...")
+# CONFIGURACIÓN DE PONDERACIÓN (K=2)
+# Anillo 0 (Centro): 100% de valor
+# Anillo 1 (Vecinos inmediatos): 60% de valor
+# Anillo 2 (Vecinos lejanos): 30% de valor
+WEIGHTS = {0: 1.0, 1: 0.6, 2: 0.3}
+
+def apply_smoothing_pro():
+    print("🔄 PASO 06: SUAVIZADO ESPACIAL PRO (K=2 PONDERADO)...")
     engine = create_engine(DB_URL)
 
-    # 1. LEER DATOS COMPLETOS
+    # 1. LEER DATOS
     print("   Leyendo tabla enriquecida...")
-    # Solo traemos lo que existe: Renta y Población Target
-    # Coalesce(0) para evitar nulos que rompen las sumas
     sql = """
     SELECT 
         h3_index, 
         COALESCE(target_pop, 0) as target_pop, 
-        COALESCE(avg_income, 0) as avg_income 
+        COALESCE(avg_income, 0) as avg_income,
+        COALESCE(gravity_score, 0) as gravity_score
     FROM retail_hexagons_enriched
     """
     df = pd.read_sql(sql, engine)
     
-    # Crear diccionarios para búsqueda ultrarrápida
+    # Diccionarios para velocidad
     pop_dict = df.set_index('h3_index')['target_pop'].to_dict()
     inc_dict = df.set_index('h3_index')['avg_income'].to_dict()
+    grav_dict = df.set_index('h3_index')['gravity_score'].to_dict()
     
-    # 2. ALGORITMO DE SUAVIZADO (K-RING)
-    print("   Calculando promedios vecinales...")
+    # 2. ALGORITMO DE SUAVIZADO PONDERADO
+    print("   Calculando catchment areas (Radio ~12 min)...")
     
     results = []
-    total = len(df)
     
     for idx, row in df.iterrows():
         h3_ix = row['h3_index']
-        # Obtenemos vecinos inmediatos (k=1) -> El central + 6 vecinos
-        neighbors = h3.k_ring(h3_ix, 1)
         
-        # Variables acumuladores
-        sum_pop = 0
-        sum_inc = 0
-        count_inc = 0
+        # ACUMULADORES PONDERADOS
+        w_sum_pop = 0
+        w_sum_grav = 0
+        w_sum_inc = 0
+        total_weight_inc = 0 # Para normalizar el promedio de renta
         
-        for n in neighbors:
-            if n in pop_dict: # Solo si el vecino existe en nuestros datos
-                # Lógica de Negocio:
-                # Población: SUMA (Catchment Area) -> Cuanta más gente alrededor, mejor.
-                sum_pop += pop_dict[n]
-                
-                # Renta: PROMEDIO (Average) -> Solo sumamos si tiene dato (>0) para no diluir con parques
-                val_inc = inc_dict[n]
-                if val_inc > 0:
-                    sum_inc += val_inc
-                    count_inc += 1
+        # Obtenemos anillos por distancia (k_ring_distances devuelve el anillo y la distancia k)
+        # hex_ring es un diccionario: {h3_index: k_distance}
+        k_rings = h3.k_ring_distances(h3_ix, 2)
         
-        # Calculamos finales
-        final_pop = sum_pop # Catchment acumulado
-        final_inc = sum_inc / count_inc if count_inc > 0 else 0 # Renta media de la zona
+        # k_rings devuelve una lista de sets: [set_k0, set_k1, set_k2]
+        for k, ring_set in enumerate(k_rings):
+            current_weight = WEIGHTS.get(k, 0)
+            
+            for neighbor in ring_set:
+                if neighbor in pop_dict:
+                    # VARIABLES DE VOLUMEN (SUMA PONDERADA)
+                    # "La gente lejos cuenta menos"
+                    w_sum_pop += pop_dict[neighbor] * current_weight
+                    w_sum_grav += grav_dict[neighbor] * current_weight
+                    
+                    # VARIABLE DE CUALIDAD (PROMEDIO PONDERADO)
+                    # "La renta se promedia, pero pesa más la cercana"
+                    val_inc = inc_dict[neighbor]
+                    if val_inc > 0:
+                        w_sum_inc += val_inc * current_weight
+                        total_weight_inc += current_weight
+        
+        # Calcular Renta Final (Promedio Ponderado)
+        final_inc = w_sum_inc / total_weight_inc if total_weight_inc > 0 else 0
         
         results.append({
             'h3_index': h3_ix,
-            'target_pop_smooth': final_pop,
+            'target_pop_smooth': w_sum_pop,
+            'gravity_smooth': w_sum_grav,
             'income_smooth': final_inc
         })
 
     df_smooth = pd.DataFrame(results)
 
     # 3. GUARDAR (UPDATE)
-    print("💾 Guardando variables 'smooth' en BBDD...")
-    
+    print("💾 Guardando en BBDD...")
     df_smooth.to_sql('temp_smooth', engine, if_exists='replace', index=False)
     
     with engine.connect() as conn:
-        # Crear columnas
         conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS target_pop_smooth FLOAT;"))
+        conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS gravity_smooth FLOAT;"))
         conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS income_smooth FLOAT;"))
         
-        # Update masivo
         conn.execute(text("""
             UPDATE retail_hexagons_enriched AS m
             SET target_pop_smooth = s.target_pop_smooth,
+                gravity_smooth = s.gravity_smooth,
                 income_smooth = s.income_smooth
             FROM temp_smooth AS s
             WHERE m.h3_index = s.h3_index;
@@ -90,8 +103,7 @@ def apply_smoothing():
         conn.execute(text("DROP TABLE temp_smooth;"))
         conn.commit()
 
-    print("✅ CONTEXTO AÑADIDO. Los datos ya no son islas.")
-    print(df_smooth.head(3))
+    print("✅ CATCHMENT AREA (K=2) APLICADO.")
 
 if __name__ == "__main__":
-    apply_smoothing()
+    apply_smoothing_pro()

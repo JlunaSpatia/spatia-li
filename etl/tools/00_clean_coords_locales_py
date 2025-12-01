@@ -1,0 +1,109 @@
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import Point
+import os
+import io
+
+# --- CONFIGURACIÓN ---
+INPUT_LOCALES = "data/raw/locales202512.csv"
+INPUT_ACTIVIDAD = "data/raw/actividadeconomica202512.csv"
+
+OUTPUT_LOCALES = "data/raw/OPEN_DATA_LOCALES_MADRID_WGS84.csv"
+OUTPUT_ACTIVIDAD = "data/raw/OPEN_DATA_ACTIVIDAD_MADRID_WGS84.csv"
+
+CRS_ORIGEN = "EPSG:25830" # UTM 30N
+CRS_DESTINO = "EPSG:4326" # WGS84
+
+def read_flexible(path):
+    """Prueba múltiples combinaciones priorizando UTF-8"""
+    # CAMBIO CLAVE: UTF-8 va PRIMERO. Es más estricto pero correcto.
+    attempts = [
+        (';', 'utf-8'),    # Estándar moderno (PRIORIDAD 1)
+        (',', 'utf-8'),    # Estándar internacional
+        (';', 'latin-1'),  # Windows antiguo (Fallback)
+        (',', 'latin-1'),
+        ('\t', 'utf-16')
+    ]
+    
+    for sep, enc in attempts:
+        try:
+            # Probamos a leer
+            df = pd.read_csv(path, sep=sep, encoding=enc, dtype=str, on_bad_lines='skip')
+            
+            # Verificación simple: ¿Tiene columnas?
+            if len(df.columns) > 1:
+                print(f"   ✅ Leído con éxito usando: sep='{sep}' encoding='{enc}'")
+                return df
+                
+        except Exception:
+            continue
+            
+    return None
+
+def process_file(input_path, output_path, type_tag):
+    print(f"\n🔧 Procesando {type_tag}: {input_path}...")
+    
+    if not os.path.exists(input_path):
+        print(f"❌ Error: No encuentro {input_path}")
+        return
+
+    # 1. LECTURA
+    df = read_flexible(input_path)
+    
+    if df is None:
+        print(f"❌ ERROR CRÍTICO: No se pudo leer el archivo.")
+        return
+
+    # 2. AUTO ID
+    df.insert(0, 'auto_id', range(1, 1 + len(df)))
+
+    # 3. DETECTAR COORDENADAS
+    col_x = next((c for c in df.columns if 'coordenada' in c.lower() and 'x' in c.lower()), None)
+    col_y = next((c for c in df.columns if 'coordenada' in c.lower() and 'y' in c.lower()), None)
+
+    if not col_x or not col_y:
+        print(f"⚠️ Sin coordenadas. Guardando limpio.")
+        df.to_csv(output_path, index=False, encoding='utf-8')
+        return
+
+    # Limpieza numérica
+    def clean_coord(val):
+        if pd.isna(val): return None
+        s = str(val).replace('.', '').replace(',', '.')
+        try:
+            return float(s)
+        except: return None
+
+    df['temp_x'] = df[col_x].apply(clean_coord)
+    df['temp_y'] = df[col_y].apply(clean_coord)
+
+    # Filtrar válidos
+    valid_coords = df.dropna(subset=['temp_x', 'temp_y']).copy()
+    
+    if valid_coords.empty:
+        print("⚠️ No hay coordenadas válidas.")
+        return
+
+    # 4. CONVERSIÓN
+    print("   🌍 Convirtiendo UTM 30N -> WGS84...")
+    gdf = gpd.GeoDataFrame(
+        valid_coords,
+        geometry=gpd.points_from_xy(valid_coords['temp_x'], valid_coords['temp_y']),
+        crs=CRS_ORIGEN
+    )
+    
+    gdf = gdf.to_crs(CRS_DESTINO)
+    
+    df.loc[valid_coords.index, 'latitud_wgs84'] = gdf.geometry.y
+    df.loc[valid_coords.index, 'longitud_wgs84'] = gdf.geometry.x
+    
+    df.drop(columns=['temp_x', 'temp_y'], inplace=True)
+
+    # 5. GUARDAR (SIEMPRE UTF-8)
+    print(f"💾 Guardando en: {output_path}")
+    df.to_csv(output_path, index=False, encoding='utf-8')
+    print("✅ Proceso terminado.")
+
+if __name__ == "__main__":
+    process_file(INPUT_LOCALES, OUTPUT_LOCALES, "LOCALES")
+    process_file(INPUT_ACTIVIDAD, OUTPUT_ACTIVIDAD, "ACTIVIDAD")
