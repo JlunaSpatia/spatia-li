@@ -25,18 +25,12 @@ def export_master_to_shp():
 
         print("   🔎 Columnas encontradas:", list(df.columns))
 
-        # Columnas que esperamos en el master
-        expected_cols = [
-            "id_local",
-            "rotulo",
-            "desc_situacion_local",
-            "desc_barrio_local",
-            "lat",
-            "lon",
-        ]
-        missing = [c for c in expected_cols if c not in df.columns]
+        # Columnas mínimas que necesitamos sí o sí
+        required_cols = ["id_local", "rotulo", "desc_situacion_local",
+                         "desc_barrio_local", "lat", "lon"]
+        missing = [c for c in required_cols if c not in df.columns]
         if missing:
-            print("❌ ERROR: Faltan columnas en el master:", missing)
+            print("❌ ERROR: Faltan columnas obligatorias en el master:", missing)
             return
 
         # 2. CONVERTIR COORDENADAS A FLOAT
@@ -60,15 +54,19 @@ def export_master_to_shp():
         )
 
         # 4. RENOMBRAR CAMPOS A ≤10 CARACTERES PARA SHAPEFILE
+        #    (seccion y division pueden o no estar; si están, se renombran)
         rename_map = {
             "id_local": "ID_LOCAL",
             "rotulo": "ROTULO",
             "desc_situacion_local": "SIT_LOCAL",
             "desc_barrio_local": "BARRIO_LOC",
+            "desc_seccion": "SECCION",
+            "desc_division": "DIVISION",
             "lat": "LAT",
             "lon": "LON",
         }
-        gdf = gdf.rename(columns=rename_map)
+        cols_to_rename = {k: v for k, v in rename_map.items() if k in gdf.columns}
+        gdf = gdf.rename(columns=cols_to_rename)
 
         # 5. FORZAR TIPOS: LAT/LON NUMÉRICOS, RESTO TEXTO
         for col in gdf.columns:
