@@ -5,7 +5,9 @@ import os
 import warnings
 from sqlalchemy import create_engine
 
-# --- CONFIGURACIÓN ---
+
+# --- CONFIGURACIÓN ---   https://datos.madrid.es/sites/v/index.jsp?vgnextoid=23160329ff639410VgnVCM2000000c205a0aRCRD&vgnextchannel=374512b9ace9f310VgnVCM100000171f5a0aRCRD
+
 FILE_LOCALES_RAW = "data/raw/locales202512.csv"
 FILE_ACTIVIDAD_RAW = "data/raw/actividadeconomica202512.csv"
 DB_URL = "postgresql://postgres:postgres@localhost:5432/spatia"

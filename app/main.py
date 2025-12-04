@@ -2,95 +2,57 @@ import streamlit as st
 import pandas as pd
 import pydeck as pdk
 import plotly.graph_objects as go
+import plotly.express as px
 from sqlalchemy import create_engine
 from openai import OpenAI
 
 # ==========================================
-# 1. CONFIGURACIÓN DE PÁGINA Y ESTILOS CSS
+# 1. CONFIGURACIÓN DE PÁGINA
 # ==========================================
 st.set_page_config(
     layout="wide", 
-    page_title="Retail Genome | Blue Banana",
-    page_icon="🍌",
+    page_title="Retail Genome | Top Picks",
+    page_icon="🏆",
     initial_sidebar_state="expanded"
 )
 
-# Inyección de CSS para Look & Feel Profesional
 st.markdown("""
 <style>
-    /* Fuente General */
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
-    html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif;
-    }
+    html, body, [class*="css"] {font-family: 'Inter', sans-serif;}
+    .block-container {padding-top: 1rem; padding-bottom: 2rem;}
     
-    /* Ajustes de Contenedor */
-    .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 1rem;
-    }
-
-    /* Títulos */
-    h1, h2, h3 {
-        font-weight: 800 !important;
-        color: #FFFFFF !important;
-    }
-
-    /* Métricas (KPIs) */
-    div[data-testid="stMetricValue"] {
-        font-size: 1.6rem !important;
-        color: #F3C623 !important; /* Amarillo Corporativo */
-        font-weight: 600;
-    }
-    div[data-testid="stMetricLabel"] {
-        font-size: 0.85rem !important;
-        color: #a0a0a0 !important;
-    }
-
-    /* Mapa PyDeck */
     div[data-testid="stDeckGlJsonChart"] {
-        height: 650px !important; /* Altura fija para alineación */
+        height: 600px !important;
         border-radius: 12px;
         box-shadow: 0 4px 20px rgba(0,0,0,0.5);
     }
-
-    /* Panel Derecho (Tarjeta de Detalle) */
     .detail-card {
         background-color: #1A1C24;
         padding: 20px;
         border-radius: 15px;
         border: 1px solid #2C2F3F;
-        box-shadow: inset 0 0 20px rgba(0,0,0,0.2);
-        height: 650px; /* Misma altura que el mapa */
-        overflow-y: auto; /* Scroll si el contenido es largo */
+        height: 1000px;
+        overflow-y: auto;
     }
-    
-    /* Caja de Respuesta IA */
     .ai-box {
         background-color: #232530;
         border-left: 4px solid #F3C623;
         padding: 15px;
-        margin-top: 15px;
         border-radius: 6px;
         font-size: 0.9rem;
-        line-height: 1.5;
-        color: #E0E0E0;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. GESTIÓN DE ESTADO (MEMORIA DE SESIÓN)
+# 2. ESTADO
 # ==========================================
-# Esto evita que la selección o la IA desaparezcan al recargar
-if 'selected_hex' not in st.session_state:
-    st.session_state.selected_hex = None
-
-if 'ai_insight' not in st.session_state:
-    st.session_state.ai_insight = None
+if 'selected_hex' not in st.session_state: st.session_state.selected_hex = None
+if 'ai_insight' not in st.session_state: st.session_state.ai_insight = None
 
 # ==========================================
-# 3. CONEXIÓN Y CARGA DE DATOS
+# 3. DATOS
 # ==========================================
 DB_URL = "postgresql://postgres:postgres@localhost:5432/spatia"
 
@@ -98,245 +60,212 @@ DB_URL = "postgresql://postgres:postgres@localhost:5432/spatia"
 def load_data(city):
     try:
         engine = create_engine(DB_URL)
-        # Traemos todos los datos necesarios
         return pd.read_sql(f"SELECT * FROM retail_results WHERE city = '{city}'", engine)
     except Exception as e:
-        st.error(f"Error conectando a PostGIS: {e}")
+        st.error(f"Error BD: {e}")
         return pd.DataFrame()
 
 # ==========================================
-# 4. FUNCIONES AUXILIARES (GRÁFICOS & IA)
+# 4. GRÁFICOS
 # ==========================================
 def make_radar_chart(row):
-    """Crea el gráfico de araña comparativo"""
     categories = ['Afinidad', 'Cercanía Café', 'Cercanía Gym', 'Sinergia Retail']
-    # Normalizamos valores a escala 0-100 para visualización
     values = [
         row['similarity'],
-        row['dist_cafe_score'] * 100,
-        row['dist_gym_score'] * 100,
-        row['dist_shop_score'] * 100
+        row.get('dist_cafe_score', 0) * 100,
+        row.get('dist_gym_score', 0) * 100,
+        row.get('dist_shop_score', 0) * 100
     ]
-    
     fig = go.Figure()
-    # Capa Candidato
-    fig.add_trace(go.Scatterpolar(
-        r=values, theta=categories, fill='toself', name='Ubicación',
-        line_color='#F3C623', fillcolor='rgba(243, 198, 35, 0.3)'
-    ))
-    # Capa Ideal
-    fig.add_trace(go.Scatterpolar(
-        r=[100]*4, theta=categories, name='Ideal',
-        line_color='rgba(255, 255, 255, 0.3)', line_dash='dot', hoverinfo='skip'
-    ))
+    fig.add_trace(go.Scatterpolar(r=values, theta=categories, fill='toself', name='Candidato', line_color='#F3C623'))
+    fig.add_trace(go.Scatterpolar(r=[100]*4, theta=categories, name='Ideal', line_color='rgba(255,255,255,0.3)', line_dash='dot'))
+    fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100], color='grey'), bgcolor='rgba(0,0,0,0)'), 
+                      showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', 
+                      margin=dict(l=30, r=30, t=30, b=30), height=250, font=dict(family="Inter"))
+    return fig
 
-    fig.update_layout(
-        polar=dict(
-            radialaxis=dict(visible=True, range=[0, 100], color='grey', showticklabels=False),
-            angularaxis=dict(color='white'),
-            bgcolor='rgba(0,0,0,0)'
-        ),
-        showlegend=False,
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        margin=dict(l=30, r=30, t=30, b=30),
-        height=250,
-        font=dict(family="Inter")
+def make_opportunity_scatter(data):
+    # El gráfico se adapta a los Top N seleccionados
+    avg_rent = data['est_monthly_rent'].mean() if 'est_monthly_rent' in data.columns else 2000
+    
+    def classify(row):
+        rent = row.get('est_monthly_rent', 9999)
+        score = row['similarity']
+        # Lógica simplificada para Top N
+        if score >= 90 and rent < avg_rent: return '💎 GEMA'
+        return '⭐ CANDIDATO'
+
+    data['Tipo'] = data.apply(classify, axis=1)
+    
+    fig = px.scatter(
+        data, x="est_monthly_rent", y="similarity", color="Tipo", size="similarity",
+        hover_data=["district_name", "ranking"], # Mostramos el ranking en el tooltip
+        color_discrete_map={"💎 GEMA": "#00FF00", "⭐ CANDIDATO": "#FFD700"},
+        title=f"ROI: Top {len(data)} Candidatos",
+        labels={"est_monthly_rent": "Alquiler (€/mes)", "similarity": "Score IA"}
     )
+    fig.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", font_color="white", height=300)
     return fig
 
 def generate_ai_insight(api_key, row):
-    """Consulta a OpenAI"""
-    if not api_key: 
-        return "⚠️ Error: Falta la API Key de OpenAI en la barra lateral."
-    
+    if not api_key: return "⚠️ Falta API Key."
     client = OpenAI(api_key=api_key)
+    
     prompt = f"""
-    Eres un Consultor Senior de Retail Location para 'Blue Banana' (Target: Gen Z, Aventura, Nivel medio-alto).
+    Eres Director de Expansión. Estás evaluando la opción #{row.get('ranking', '?')} del ranking.
+    Ubicación: {row['city']} ({row.get('district_name', 'Zona')}).
+    Datos:
+    - Score IA: {row['similarity']:.1f}/100.
+    - Alquiler: {row.get('est_monthly_rent',0):.0f}€ ({row.get('price_m2',0):.0f}€/m2).
+    - Entorno: Café a {row['dist_cafe']:.0f}s, Gym a {row['dist_gym']:.0f}s.
     
-    Analiza esta ubicación en {row['city']}:
-    - Score Global: {row['similarity']:.1f}/100.
-    - Café Especialidad: a {row['dist_cafe']:.0f} seg.
-    - Crossfit/Gym: a {row['dist_gym']:.0f} seg.
-    - Competencia: a {row['dist_shop']:.0f} seg.
-    
-    Escribe un "Investment Memo" de 3 puntos:
-    1. Veredicto (Go/No-Go).
-    2. Por qué encaja (o no) con el estilo de vida de la marca.
-    3. Una recomendación táctica.
+    Redacta un veredicto directo de 3 líneas: ¿Por qué esta opción está en el Top? ¿Qué riesgo tiene?
     """
     try:
-        res = client.chat.completions.create(
-            model="gpt-4o-mini", 
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7
-        )
+        res = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}])
         return res.choices[0].message.content
-    except Exception as e: 
-        return f"❌ Error conectando con la IA: {e}"
+    except Exception as e: return f"Error IA: {e}"
 
 # ==========================================
-# 5. BARRA LATERAL (CONTROLES)
+# 5. SIDEBAR (NUEVA LÓGICA DE FILTRADO)
 # ==========================================
 with st.sidebar:
-    st.title("🍌 Retail Genome")
-    st.caption("Site Selection Intelligence v1.0")
-    st.divider()
-    
-    # Selectores
+    st.title("🏆 Top Picks")
     city = st.selectbox("📍 Ciudad", ["Valencia", "Madrid"])
     
-    st.markdown("### 🎯 Estrategia")
-    # Slider de Rango (Min - Max)
-    score_range = st.slider("Rango de Afinidad (%)", 0.0, 100.0, (75.0, 100.0))
-    # Filtro manual
-    max_cafe = st.number_input("Máx min. a Café", value=10) * 60 # a segundos
-
     st.divider()
     
-    st.markdown("### 🧠 Inteligencia")
-    openai_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
+    # 1. FILTRO DE CANTIDAD (EL RANKING)
+    st.markdown("### 🥇 Ranking")
+    top_n = st.slider("Mostrar Top N Resultados", 1, 50, 10)
+    
+    # 2. FILTROS DUROS (CONSTRAINT)
+    st.markdown("### 🚫 Líneas Rojas (Constraints)")
+    max_rent = st.number_input("Presupuesto Máx (€/mes)", value=6000, step=500)
+    max_dist_metro = st.slider("Máx. min a Metro", 5, 30, 15) * 60 # a segundos
+    
+    st.divider()
+    
+    st.markdown("### 🎨 Capas")
+    layer_mode = st.radio("Color Mapa:", ["Ranking (Oro=Top 1)", "Precio (€)"], index=0)
+    
+    st.divider()
+    openai_key = st.text_input("OpenAI Key", type="password")
 
 # ==========================================
-# 6. PROCESAMIENTO DE DATOS
+# 6. LÓGICA DE NEGOCIO (SORT & SLICE)
 # ==========================================
 df = load_data(city)
+if df.empty: st.stop()
 
-if df.empty:
-    st.warning("⚠️ No hay datos cargados. Ejecuta los scripts ETL primero.")
-    st.stop()
-
-# Filtros Pandas
-mask = (
-    (df['similarity'] >= score_range[0]) & 
-    (df['similarity'] <= score_range[1]) & 
-    (df['dist_cafe'] <= max_cafe)
+# 1. Aplicamos restricciones duras (Budget y Metro)
+mask_hard = (
+    (df.get('est_monthly_rent', 0) <= max_rent) & 
+    (df['dist_transit'] <= max_dist_metro)
 )
-df_filtered = df[mask].copy()
+df_valid = df[mask_hard].copy()
 
-# Asignación de colores semánticos para el mapa
-def get_hex_color(score):
-    if score >= 92: return [243, 198, 35, 255]   # Amarillo (Top)
-    if score >= 85: return [64, 224, 208, 240]   # Turquesa
-    if score >= 75: return [30, 144, 255, 220]   # Azul
-    return [100, 110, 120, 180]                  # Gris (Bajo)
+# 2. ORDENAMOS por Score (De mejor a peor)
+df_sorted = df_valid.sort_values('similarity', ascending=False).reset_index(drop=True)
 
-df_filtered['color'] = df_filtered['similarity'].apply(get_hex_color)
+# 3. CORTAMOS (Top N)
+df_top = df_sorted.head(top_n).copy()
+
+# 4. Añadimos columna de Ranking (1, 2, 3...)
+df_top['ranking'] = df_top.index + 1
+
+# Colores Dinámicos para el Mapa
+def get_color(row, mode):
+    if mode == "Precio (€)":
+        price = row.get('est_monthly_rent', 0)
+        if price > 4000: return [255, 75, 75, 200] # Rojo
+        return [75, 255, 75, 200] # Verde
+    else: # Por Ranking
+        rank = row['ranking']
+        if rank == 1: return [255, 215, 0, 255]   # Oro (Top 1)
+        if rank <= 3: return [192, 192, 192, 240] # Plata (Top 3)
+        if rank <= 10: return [205, 127, 50, 220] # Bronce
+        return [100, 100, 255, 180]               # Azul (Resto)
+
+df_top['color'] = df_top.apply(lambda x: get_color(x, layer_mode), axis=1)
 
 # ==========================================
-# 7. LAYOUT PRINCIPAL
+# 7. LAYOUT
 # ==========================================
-
-# Dos columnas: Mapa (ancho) y Detalles (estrecho)
 col_map, col_details = st.columns([2.3, 1])
 
-# --- COLUMNA IZQUIERDA: MAPA ---
 with col_map:
-    # Fila de KPIs
+    # KPI Row
     k1, k2, k3 = st.columns(3)
-    k1.metric("Oportunidades", f"{len(df_filtered)}")
-    k2.metric("Top Afinidad", f"{df_filtered['similarity'].max():.1f}%" if not df_filtered.empty else "0%")
-    k3.metric("Mejor Acceso Café", f"{df_filtered['dist_cafe'].min()/60:.1f} min" if not df_filtered.empty else "-")
-
-    # Configuración de Vista Inicial
-    if not df_filtered.empty:
-        lat, lon, zoom = df_filtered['lat'].mean(), df_filtered['lon'].mean(), 12.5
-    else:
-        lat, lon, zoom = df['lat'].mean(), df['lon'].mean(), 11
-
-    # Definición del Mapa (PyDeck)
+    k1.metric("Candidatos Filtrados", f"{len(df_top)}")
+    
+    # Datos del Ganador (Rank 1)
+    if not df_top.empty:
+        winner = df_top.iloc[0]
+        k2.metric("🏆 Ganador (Score)", f"{winner['similarity']:.1f}")
+        k3.metric("Alquiler Ganador", f"{winner.get('est_monthly_rent',0):.0f}€")
+    
+    # Mapa
+    lat, lon = (df_top['lat'].mean(), df_top['lon'].mean()) if not df_top.empty else (40.4, -3.7)
+    
     deck = pdk.Deck(
         layers=[pdk.Layer(
-            "H3HexagonLayer",
-            df_filtered,
-            pickable=True,
-            stroked=True,
-            filled=True,
-            extruded=True,
-            get_hexagon="h3_index",
-            get_fill_color="color",
-            get_elevation="similarity",
-            elevation_scale=12,
-            elevation_range=[0, 800],
-            coverage=0.85,
-            auto_highlight=True,
+            "H3HexagonLayer", df_top, pickable=True, extruded=True,
+            get_hexagon="h3_index", get_fill_color="color", get_elevation="similarity",
+            elevation_scale=15, elevation_range=[0, 800], coverage=0.85, auto_highlight=True
         )],
-        initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=zoom, pitch=50, bearing=-10),
-        map_style=pdk.map_styles.CARTO_DARK, # Estilo Oscuro Premium
-        tooltip={"html": "<b>Afinidad: {similarity:.1f}%</b><br>Click para analizar"}
+        initial_view_state=pdk.ViewState(latitude=lat, longitude=lon, zoom=12.5, pitch=50),
+        map_style=pdk.map_styles.CARTO_DARK,
+        tooltip={"html": "<b>RANKING: #{ranking}</b><br>Score: {similarity:.1f}<br>Alquiler: {est_monthly_rent:.0f}€"}
     )
-    
-    # RENDERIZADO CON EVENTO DE SELECCIÓN
-    # on_select="rerun" es clave para la interactividad
     event = st.pydeck_chart(deck, on_select="rerun", selection_mode="single-object", use_container_width=True)
+    
+    # Gráfico Scatter (Solo de los Top N)
+    st.divider()
+    if not df_top.empty and 'est_monthly_rent' in df_top.columns:
+        st.plotly_chart(make_opportunity_scatter(df_top), use_container_width=True)
 
-# --- LÓGICA DE SELECCIÓN ---
-# 1. ¿El usuario hizo clic en el mapa?
+# Lógica Selección
 if event.selection and len(event.selection['objects']) > 0:
-    new_hex = event.selection['objects'][0]['h3_index']
-    # Si cambió de hexágono, reseteamos el análisis de IA
-    if new_hex != st.session_state.selected_hex:
-        st.session_state.ai_insight = None
-    st.session_state.selected_hex = new_hex
+    st.session_state.selected_hex = event.selection['objects'][0]['h3_index']
+    if st.session_state.selected_hex != event.selection['objects'][0]['h3_index']: st.session_state.ai_insight = None
 
-# 2. Recuperamos los datos del hexágono seleccionado (desde la memoria)
 selected_row = None
 if st.session_state.selected_hex:
-    # Buscamos en el dataframe completo (no solo el filtrado, por si acaso)
-    rows = df[df['h3_index'] == st.session_state.selected_hex]
-    if not rows.empty:
-        selected_row = rows.iloc[0]
+    rows = df_top[df_top['h3_index'] == st.session_state.selected_hex] # Buscamos solo en los top
+    if not rows.empty: selected_row = rows.iloc[0]
 
-# --- COLUMNA DERECHA: FICHA DE DETALLE ---
 with col_details:
     with st.container():
-        # Abrimos el contenedor con estilo CSS personalizado
         st.markdown('<div class="detail-card">', unsafe_allow_html=True)
-        
         if selected_row is not None:
-            # CABECERA
-            st.subheader("📍 Análisis de Zona")
-            st.caption(f"Hexágono ID: {selected_row['h3_index']}")
+            # CABECERA DESTACADA
+            st.markdown(f"### 🎖️ Opción #{selected_row['ranking']}")
+            st.caption(f"ID: {selected_row['h3_index']} | {selected_row.get('district_name', '')}")
             
-            # GRÁFICO RADAR
             st.plotly_chart(make_radar_chart(selected_row), use_container_width=True, config={'displayModeBar': False})
             
-            # MÉTRICAS CLAVE
             c1, c2 = st.columns(2)
-            c1.metric("Score Total", f"{selected_row['similarity']:.1f}%")
-            c2.metric("Café (Pie)", f"{selected_row['dist_cafe']/60:.1f} min")
+            c1.metric("Score IA", f"{selected_row['similarity']:.1f}")
+            c2.metric("Alquiler", f"{selected_row.get('est_monthly_rent',0):.0f}€")
             
             st.divider()
-            
-            # SECCIÓN INTELIGENCIA ARTIFICIAL
-            st.subheader("🤖 AI Investment Memo")
-            
-            # Botón (Solo si no hay insight generado ya)
             if st.session_state.ai_insight is None:
-                if st.button("Generar Informe Ejecutivo", type="primary", use_container_width=True):
-                    with st.spinner("El analista virtual está estudiando la zona..."):
-                        insight = generate_ai_insight(openai_key, selected_row)
-                        st.session_state.ai_insight = insight
-                        st.rerun() # Recargamos para mostrar el resultado
+                if st.button("🤖 Juicio del Experto AI", type="primary", use_container_width=True):
+                    with st.spinner("Analizando..."):
+                        st.session_state.ai_insight = generate_ai_insight(openai_key, selected_row)
+                        st.rerun()
             
-            # Mostrar Resultado (Persistente)
             if st.session_state.ai_insight:
                 st.markdown(f'<div class="ai-box">{st.session_state.ai_insight}</div>', unsafe_allow_html=True)
-                
-                if st.button("🔄 Nuevo Análisis", help="Borrar y generar de nuevo"):
-                    st.session_state.ai_insight = None
-                    st.rerun()
-                    
+                if st.button("🔄 Regenerar"): st.session_state.ai_insight = None; st.rerun()
         else:
-            # ESTADO VACÍO (INSTRUCCIONES)
-            st.info("👈 Selecciona una columna en el mapa para ver su ficha técnica.")
-            
-            st.markdown("---")
-            st.markdown("**🏆 Top 5 Candidatos Globales:**")
+            st.info("👈 Pulsa en una columna del mapa.")
+            st.markdown("### 📋 Tabla de Posiciones")
+            # Tabla limpia con Ranking
+            cols_table = ['ranking', 'similarity', 'est_monthly_rent']
             st.dataframe(
-                df_filtered.sort_values('similarity', ascending=False).head(5)[['h3_index', 'similarity']],
-                hide_index=True,
+                df_top[cols_table].set_index('ranking'),
                 use_container_width=True
             )
-
-        st.markdown('</div>', unsafe_allow_html=True) # Cierre del div detail-card
+        st.markdown('</div>', unsafe_allow_html=True)
