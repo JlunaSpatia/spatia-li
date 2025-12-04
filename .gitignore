@@ -246,3 +246,5 @@ changes*.json
 /tmp/
 
 # PRECAUCIÓN: No uses *.json solo, o ignorarás archivos importantes como package.json
+data/export_shp/madrid_master_census_v2.shp.DESKTOP-60BPKUD.8468.20680.sr.lock
+data/export_shp/madrid_master_census_v3.shp.DESKTOP-60BPKUD.8468.20680.sr.lock
