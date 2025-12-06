@@ -3,11 +3,10 @@ import geopandas as gpd
 import numpy as np
 import os
 import warnings
-from sqlalchemy import create_engine
+import logging
+from sqlalchemy import create_engine, text
 
-
-# --- CONFIGURACIÓN ---   https://datos.madrid.es/sites/v/index.jsp?vgnextoid=23160329ff639410VgnVCM2000000c205a0aRCRD&vgnextchannel=374512b9ace9f310VgnVCM100000171f5a0aRCRD
-
+# --- CONFIGURACIÓN ---
 FILE_LOCALES_RAW = "data/raw/locales202512.csv"
 FILE_ACTIVIDAD_RAW = "data/raw/actividadeconomica202512.csv"
 DB_URL = "postgresql://postgres:postgres@localhost:5432/spatia"
@@ -16,7 +15,9 @@ DB_URL = "postgresql://postgres:postgres@localhost:5432/spatia"
 CRS_ORIGEN = "EPSG:25830"
 CRS_DESTINO = "EPSG:4326"
 
-warnings.filterwarnings("ignore")
+# Descomentar para debug profundo de SQL
+# logging.basicConfig()
+# logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
 
 def clean_number_madrid(val):
     if pd.isna(val) or str(val).strip() == "": return np.nan
@@ -30,7 +31,6 @@ def clean_number_madrid(val):
 
 def read_smart_csv(path):
     if not os.path.exists(path): return None
-    # Probamos UTF-8 primero, que es el estándar moderno
     attempts = [
         (";", "utf-8"), 
         (";", "latin-1"), 
@@ -41,13 +41,12 @@ def read_smart_csv(path):
         try:
             df = pd.read_csv(path, sep=sep, encoding=enc, dtype=str, on_bad_lines="skip")
             if len(df.columns) > 1: 
-                print(f"   ✅ Leído correctamente con encoding: {enc}")
+                print(f"    ✅ Leído correctamente con encoding: {enc}")
                 return df
         except: continue
     return None
 
 def prepare_coordinates(df, tag):
-    # Buscamos columnas dinámicamente
     cx_loc = next((c for c in df.columns if "coordenada_x_local" in c.lower()), None)
     cy_loc = next((c for c in df.columns if "coordenada_y_local" in c.lower()), None)
     cx_agr = next((c for c in df.columns if "coordenada_x_agrup" in c.lower()), None)
@@ -70,8 +69,24 @@ def prepare_coordinates(df, tag):
     return df
 
 def upload_to_postgis_history(df):
-    print("   🗄️ Subiendo Snapshot a PostGIS ('locales_madrid_history')...")
+    """
+    Sube datos verificando duplicados por snapshot_date.
+    Reglas:
+    1. Si snapshot no existe -> INSERT.
+    2. Si snapshot existe y count es igual -> SKIP (Ya está subido).
+    3. Si snapshot existe y count es distinto -> WARNING (Posible error de datos).
+    """
+    print("    🗄️  Verificando estado en PostGIS...")
     engine = create_engine(DB_URL)
+    table_name = 'locales_madrid_history'
+    
+    # Obtenemos el snapshot actual del dataframe
+    if 'snapshot_date' not in df.columns:
+        print("    ❌ Error: El DataFrame no tiene la columna 'snapshot_date'.")
+        return
+
+    current_snapshot = df['snapshot_date'].iloc[0]
+    new_rows_count = len(df)
     
     # Convertimos a GeoDataFrame
     gdf = gpd.GeoDataFrame(
@@ -79,21 +94,56 @@ def upload_to_postgis_history(df):
         geometry=gpd.points_from_xy(df['lon'], df['lat']),
         crs="EPSG:4326"
     )
-    
-    # Subimos en modo APPEND
+
+    db_rows_count = 0
+    table_exists = False
+
+    # 1. VERIFICACIÓN CONTRA BBDD
     try:
-        gdf.to_postgis('locales_madrid_history', engine, if_exists='append', index=False)
-        print(f"   ✅ {len(gdf)} registros añadidos al histórico.")
+        with engine.connect() as conn:
+            # Verificar si existe la tabla
+            exists_query = text(f"SELECT to_regclass('public.{table_name}');")
+            if conn.execute(exists_query).scalar():
+                table_exists = True
+                
+                # Verificar si existe ESTE snapshot y cuántas filas tiene
+                count_query = text(f"SELECT count(*) FROM public.{table_name} WHERE snapshot_date = :snap")
+                db_rows_count = conn.execute(count_query, {"snap": current_snapshot}).scalar()
+            else:
+                print(f"    ✨ La tabla '{table_name}' no existe. Se creará desde cero.")
+
     except Exception as e:
-        print(f"   ❌ Error subiendo a BBDD: {e}")
+        print(f"    ⚠️ Error conectando para verificar: {e}")
+        return
+
+    # 2. LÓGICA DE NEGOCIO
+    if table_exists and db_rows_count > 0:
+        if db_rows_count == new_rows_count:
+            print(f"    🛑 INFO: El snapshot {current_snapshot} ya existe con {db_rows_count} filas.")
+            print("       -> No se realizará ninguna acción (SKIP).")
+            return
+        else:
+            print(f"    ⚠️ WARNING: El snapshot {current_snapshot} YA EXISTE en BBDD pero los números no cuadran.")
+            print(f"       -> Filas en BBDD: {db_rows_count} vs Filas Nuevas: {new_rows_count}")
+            print("       -> 🛡️ POR SEGURIDAD NO SE SUBIRÁ NADA. Revisa si es una carga parcial.")
+            return
+
+    # 3. SUBIDA (Solo si no existe o la tabla es nueva)
+    print(f"    🚀 Subiendo NUEVO snapshot ({current_snapshot}) con {new_rows_count} filas...")
+    try:
+        gdf.to_postgis(table_name, engine, if_exists='append', index=False, chunksize=5000)
+        print(f"    ✅ Carga completada exitosamente.")
+    except Exception as e:
+        print(f"    ❌ Error CRÍTICO subiendo datos: {e}")
+
 
 def run_master_pipeline():
-    print("🚀 INICIANDO GENERACIÓN MASTER CENSUS (CON UTF-8 SIG)...")
+    print("🚀 INICIANDO GENERACIÓN MASTER CENSUS...")
 
     # 1. CARGA
-    print("   📖 Leyendo Locales...")
+    print("    📖 Leyendo Locales...")
     df_loc = read_smart_csv(FILE_LOCALES_RAW)
-    print("   📖 Leyendo Actividad...")
+    print("    📖 Leyendo Actividad...")
     df_act = read_smart_csv(FILE_ACTIVIDAD_RAW)
     
     if df_loc is None: return
@@ -117,7 +167,7 @@ def run_master_pipeline():
         snapshot_str = pd.Timestamp.now().strftime("%Y%m%d")
         snapshot_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
-    print(f"   📅 Fecha Snapshot: {snapshot_date}")
+    print(f"    📅 Fecha Snapshot detectada: {snapshot_date}")
 
     # 3. PROCESAR COORDENADAS
     if df_act is not None:
@@ -135,7 +185,7 @@ def run_master_pipeline():
 
     df_loc = prepare_coordinates(df_loc, "LOC")
     
-    print("   🚑 Cruzando ficheros...")
+    print("    🚑 Cruzando ficheros...")
     merged = df_loc.merge(act_lookup, on="id_local", how="left", suffixes=("", "_act"))
 
     loc_ok = merged["BEST_X_LOC"] > 1000
@@ -149,7 +199,7 @@ def run_master_pipeline():
     ].copy()
 
     # 4. PROYECCIÓN WGS84
-    print("   🌍 Proyectando a WGS84...")
+    print("    🌍 Proyectando a WGS84...")
     gdf = gpd.GeoDataFrame(
         df_geo, 
         geometry=gpd.points_from_xy(df_geo["FINAL_X"], df_geo["FINAL_Y"]), 
@@ -166,7 +216,7 @@ def run_master_pipeline():
 
     df_geo['snapshot_date'] = snapshot_date
 
-    # 6. GUARDAR MASTER CSV (FIX UTF-8 SIG)
+    # 6. GUARDAR MASTER CSV
     output_filename = f"data/raw/MADRID_MASTER_CENSUS_{snapshot_str}.csv"
     
     keep_cols = [
@@ -174,16 +224,12 @@ def run_master_pipeline():
         "desc_seccion", "desc_division", "desc_barrio_local", 
         "lat", "lon"
     ]
-    # Filtramos columnas que existan realmente
     final_cols = [c for c in keep_cols if c in df_geo.columns]
     
-    print(f"   💾 Guardando en: {output_filename}")
-    
-    # --- AQUÍ ESTÁ EL CAMBIO ---
-    # encoding='utf-8-sig' fuerza el BOM para que Excel lea bien las tildes
+    print(f"    💾 Guardando CSV local: {output_filename}")
     df_geo[final_cols].to_csv(output_filename, index=False, sep=";", encoding="utf-8-sig")
 
-    # 7. SUBIR A POSTGIS
+    # 7. SUBIR A POSTGIS (Con lógica inteligente)
     upload_to_postgis_history(df_geo[final_cols])
 
 if __name__ == "__main__":
