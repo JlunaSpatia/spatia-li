@@ -135,7 +135,7 @@ def enrich_demographics():
     # 5. INTERPOLACIÓN
     df_income_final = spatial_interpolation(gdf_hex, gdf_census_full, 'renta')
     
-    # 6. GUARDAR (CREAR O ACTUALIZAR)
+    # 6. GUARDAR (SINCRONIZAR + ACTUALIZAR)
     print("💾 Guardando Renta en BBDD...")
     
     # Subir datos nuevos a una tabla temporal
@@ -143,21 +143,31 @@ def enrich_demographics():
     
     with engine.connect() as conn:
         # A. Inicializar tabla 'retail_hexagons_enriched' si no existe
-        # La creamos como una copia exacta de la tabla base 'retail_hexagons'
-        print("      -> Verificando tabla destino...")
+        print("      -> Verificando estructura de tablas...")
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS retail_hexagons_enriched AS 
             SELECT * FROM retail_hexagons;
         """))
         
-        # B. Asegurar que la columna 'avg_income' existe
+        # B. SINCRONIZAR HEXÁGONOS NUEVOS (La corrección clave)
+        # Si hemos añadido una ciudad nueva en el paso 01, sus hexágonos existen en 'retail_hexagons'
+        # pero no en 'retail_hexagons_enriched'. Aquí los insertamos.
+        print("      -> Sincronizando nuevos territorios...")
+        conn.execute(text("""
+            INSERT INTO retail_hexagons_enriched (h3_index, city, geometry, dist_cafe, dist_gym, dist_shop, dist_transit, lat, lon)
+            SELECT h3_index, city, geometry, dist_cafe, dist_gym, dist_shop, dist_transit, lat, lon
+            FROM retail_hexagons
+            WHERE h3_index NOT IN (SELECT h3_index FROM retail_hexagons_enriched);
+        """))
+
+        # C. Asegurar que la columna 'avg_income' existe
         conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS avg_income FLOAT;"))
         
-        # C. Crear índice para que el update sea rápido
+        # D. Crear índices
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_enriched_h3 ON retail_hexagons_enriched(h3_index);"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_temp_income_h3 ON temp_income(h3_index);"))
 
-        # D. Update masivo usando la tabla temporal
+        # E. Update masivo
         print("      -> Ejecutando UPDATE SQL...")
         conn.execute(text("""
             UPDATE retail_hexagons_enriched AS m
@@ -166,11 +176,11 @@ def enrich_demographics():
             WHERE m.h3_index = s.h3_index;
         """))
         
-        # E. Limpieza
+        # F. Limpieza
         conn.execute(text("DROP TABLE temp_income;"))
         conn.commit()
         
-    print("✅ ¡RENTA BRUTA POR HOGAR INTEGRADA!")
+    print("✅ ¡RENTA INTEGRADA Y SINCRONIZADA!")
     print(df_income_final.sort_values('avg_income', ascending=False).head(3))
 
 if __name__ == "__main__":
