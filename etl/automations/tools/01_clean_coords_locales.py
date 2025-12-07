@@ -15,9 +15,7 @@ DB_URL = "postgresql://postgres:postgres@localhost:5432/spatia"
 CRS_ORIGEN = "EPSG:25830"
 CRS_DESTINO = "EPSG:4326"
 
-# Descomentar para debug profundo de SQL
-# logging.basicConfig()
-# logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
+# --- FUNCIONES DE LIMPIEZA Y LOGICA DE NEGOCIO ---
 
 def clean_number_madrid(val):
     if pd.isna(val) or str(val).strip() == "": return np.nan
@@ -28,6 +26,31 @@ def clean_number_madrid(val):
         s = s.replace(",", ".")
     try: return float(s)
     except: return np.nan
+
+def categorize_activity(row):
+    """
+    Clasifica la actividad en grupos estratégicos basándose en
+    Sección, División y Rótulo.
+    """
+    # Concatenamos campos clave, manejando nulos
+    t1 = str(row.get('desc_seccion', ''))
+    t2 = str(row.get('desc_division', ''))
+    t3 = str(row.get('rotulo', ''))
+    
+    # Unificamos texto en mayúsculas para búsqueda
+    texto = (t1 + " " + t2 + " " + t3).upper()
+    
+    # Limpieza básica de artifacts de conversión
+    if 'NAN' in texto: 
+        texto = texto.replace('NAN', '')
+
+    # Lógica de reglas (Prioridad de arriba a abajo)
+    if any(x in texto for x in ['PRENDA', 'VESTIR', 'CALZADO', 'CUERO', 'TEXTIL', 'MODA', 'JOYERIA', 'RELOJERIA']): return 'FASHION'
+    if any(x in texto for x in ['COMIDAS', 'BEBIDAS', 'RESTAURANTE', 'BAR', 'CAFETERIA', 'HOSTELERIA']): return 'HORECA'
+    if any(x in texto for x in ['PELUQUERIA', 'ESTETICA', 'FARMACIA', 'SANITARIAS', 'GIMNASIO', 'DEPORTIVAS']): return 'WELLNESS'
+    if any(x in texto for x in ['ALIMENTACION', 'SUPERMERCADO', 'FRUTA', 'CARNE', 'PESCADO', 'PAN']): return 'FOOD'
+
+    return 'OTHER'
 
 def read_smart_csv(path):
     if not os.path.exists(path): return None
@@ -70,19 +93,14 @@ def prepare_coordinates(df, tag):
 
 def upload_to_postgis_history(df):
     """
-    Sube datos verificando duplicados por snapshot_date.
-    Reglas:
-    1. Si snapshot no existe -> INSERT.
-    2. Si snapshot existe y count es igual -> SKIP (Ya está subido).
-    3. Si snapshot existe y count es distinto -> WARNING (Posible error de datos).
+    Sube datos verificando duplicados y gestionando la estructura de la tabla.
     """
     print("    🗄️  Verificando estado en PostGIS...")
     engine = create_engine(DB_URL)
     table_name = 'locales_madrid_history'
     
-    # Obtenemos el snapshot actual del dataframe
     if 'snapshot_date' not in df.columns:
-        print("    ❌ Error: El DataFrame no tiene la columna 'snapshot_date'.")
+        print("    ❌ Error: Falta 'snapshot_date'.")
         return
 
     current_snapshot = df['snapshot_date'].iloc[0]
@@ -98,37 +116,42 @@ def upload_to_postgis_history(df):
     db_rows_count = 0
     table_exists = False
 
-    # 1. VERIFICACIÓN CONTRA BBDD
+    # 1. VERIFICACIÓN Y AUTO-MIGRACIÓN DE COLUMNAS
     try:
         with engine.connect() as conn:
-            # Verificar si existe la tabla
+            # Check existencia tabla
             exists_query = text(f"SELECT to_regclass('public.{table_name}');")
             if conn.execute(exists_query).scalar():
                 table_exists = True
                 
-                # Verificar si existe ESTE snapshot y cuántas filas tiene
+                # --- AUTO MIGRACIÓN: Verificar si existe la columna category_group ---
+                col_check = text(f"SELECT column_name FROM information_schema.columns WHERE table_name='{table_name}' AND column_name='category_group'")
+                if not conn.execute(col_check).scalar():
+                    print("    🔧 Detectada falta de columna 'category_group'. Creándola en BBDD...")
+                    conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN category_group TEXT"))
+                    conn.commit() # Importante commitear el cambio de estructura
+                # ---------------------------------------------------------------------
+
+                # Verificar duplicidad de snapshot
                 count_query = text(f"SELECT count(*) FROM public.{table_name} WHERE snapshot_date = :snap")
                 db_rows_count = conn.execute(count_query, {"snap": current_snapshot}).scalar()
             else:
                 print(f"    ✨ La tabla '{table_name}' no existe. Se creará desde cero.")
 
     except Exception as e:
-        print(f"    ⚠️ Error conectando para verificar: {e}")
+        print(f"    ⚠️ Error conectando para verificar/alterar tabla: {e}")
         return
 
-    # 2. LÓGICA DE NEGOCIO
+    # 2. LÓGICA DE DUPLICADOS
     if table_exists and db_rows_count > 0:
         if db_rows_count == new_rows_count:
-            print(f"    🛑 INFO: El snapshot {current_snapshot} ya existe con {db_rows_count} filas.")
-            print("       -> No se realizará ninguna acción (SKIP).")
+            print(f"    🛑 INFO: Snapshot {current_snapshot} ya existe ({db_rows_count} filas). SKIP.")
             return
         else:
-            print(f"    ⚠️ WARNING: El snapshot {current_snapshot} YA EXISTE en BBDD pero los números no cuadran.")
-            print(f"       -> Filas en BBDD: {db_rows_count} vs Filas Nuevas: {new_rows_count}")
-            print("       -> 🛡️ POR SEGURIDAD NO SE SUBIRÁ NADA. Revisa si es una carga parcial.")
+            print(f"    ⚠️ WARNING: Conflicto de filas en {current_snapshot} (DB: {db_rows_count} vs New: {new_rows_count}). NO SE SUBE.")
             return
 
-    # 3. SUBIDA (Solo si no existe o la tabla es nueva)
+    # 3. SUBIDA
     print(f"    🚀 Subiendo NUEVO snapshot ({current_snapshot}) con {new_rows_count} filas...")
     try:
         gdf.to_postgis(table_name, engine, if_exists='append', index=False, chunksize=5000)
@@ -136,9 +159,8 @@ def upload_to_postgis_history(df):
     except Exception as e:
         print(f"    ❌ Error CRÍTICO subiendo datos: {e}")
 
-
 def run_master_pipeline():
-    print("🚀 INICIANDO GENERACIÓN MASTER CENSUS...")
+    print("🚀 INICIANDO GENERACIÓN MASTER CENSUS + BUSINESS LOGIC...")
 
     # 1. CARGA
     print("    📖 Leyendo Locales...")
@@ -167,7 +189,7 @@ def run_master_pipeline():
         snapshot_str = pd.Timestamp.now().strftime("%Y%m%d")
         snapshot_date = pd.Timestamp.now().strftime("%Y-%m-%d")
 
-    print(f"    📅 Fecha Snapshot detectada: {snapshot_date}")
+    print(f"    📅 Fecha Snapshot: {snapshot_date}")
 
     # 3. PROCESAR COORDENADAS
     if df_act is not None:
@@ -216,20 +238,25 @@ def run_master_pipeline():
 
     df_geo['snapshot_date'] = snapshot_date
 
+    # --- NUEVO: CÁLCULO DE CATEGORÍAS ---
+    print("    🏷️  Calculando campo 'category_group'...")
+    df_geo['category_group'] = df_geo.apply(categorize_activity, axis=1)
+
     # 6. GUARDAR MASTER CSV
     output_filename = f"data/raw/MADRID_MASTER_CENSUS_{snapshot_str}.csv"
     
     keep_cols = [
         "snapshot_date", "id_local", "rotulo", "desc_situacion_local", 
         "desc_seccion", "desc_division", "desc_barrio_local", 
-        "lat", "lon"
+        "lat", "lon", "category_group" # <--- AÑADIDO AQUI
     ]
+    
     final_cols = [c for c in keep_cols if c in df_geo.columns]
     
-    print(f"    💾 Guardando CSV local: {output_filename}")
+    print(f"    💾 Guardando CSV: {output_filename}")
     df_geo[final_cols].to_csv(output_filename, index=False, sep=";", encoding="utf-8-sig")
 
-    # 7. SUBIR A POSTGIS (Con lógica inteligente)
+    # 7. SUBIR A POSTGIS
     upload_to_postgis_history(df_geo[final_cols])
 
 if __name__ == "__main__":

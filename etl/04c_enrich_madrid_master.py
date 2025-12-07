@@ -1,162 +1,118 @@
 import pandas as pd
-import geopandas as gpd
 from sqlalchemy import create_engine, text
-import h3
-import glob
-import os
 import warnings
 
 # --- CONFIGURACIÓN ---
 DB_URL = "postgresql://postgres:postgres@localhost:5432/spatia"
-H3_RES = 9
-RAW_DIR = "data/raw"
-PATTERN = "MADRID_MASTER_CENSUS_*.csv" # Busca archivos con fecha
 
 warnings.filterwarnings("ignore")
 
-def get_latest_file():
-    """Busca el archivo Master más reciente en la carpeta"""
-    files = glob.glob(os.path.join(RAW_DIR, PATTERN))
-    if not files: return None
-    return sorted(files)[-1]
-
-def categorize_activity(row):
-    """Clasifica la actividad en grupos estratégicos"""
-    texto = (str(row.get('desc_seccion', '')) + " " + 
-             str(row.get('desc_division', '')) + " " + 
-             str(row.get('rotulo', ''))).upper()
-    
-    if 'NAN' in texto: texto = ""
-
-    if any(x in texto for x in ['PRENDA', 'VESTIR', 'CALZADO', 'CUERO', 'TEXTIL', 'MODA', 'JOYERIA', 'RELOJERIA']):
-        return 'FASHION'
-    if any(x in texto for x in ['COMIDAS', 'BEBIDAS', 'RESTAURANTE', 'BAR', 'CAFETERIA', 'HOSTELERIA']):
-        return 'HORECA'
-    if any(x in texto for x in ['PELUQUERIA', 'ESTETICA', 'FARMACIA', 'SANITARIAS', 'GIMNASIO', 'DEPORTIVAS']):
-        return 'WELLNESS'
-    if any(x in texto for x in ['ALIMENTACION', 'SUPERMERCADO', 'FRUTA', 'CARNE', 'PESCADO', 'PAN']):
-        return 'FOOD'
-
-    return 'OTHER'
-
-def process_madrid_master():
-    print("🏙️ PROCESANDO MASTER CENSUS MADRID (CON GESTIÓN DE HISTÓRICO)...")
-    
-    # 1. BUSCAR ARCHIVO
-    latest_file = get_latest_file()
-    if not latest_file:
-        print(f"❌ ERROR: No encuentro ningún archivo {PATTERN}")
-        return
-    
-    print(f"   📖 Leyendo: {os.path.basename(latest_file)}...")
-    
-    # 2. CARGAR DATOS
-    try:
-        df = pd.read_csv(latest_file, sep=';', encoding='utf-8-sig', dtype=str)
-    except Exception as e:
-        print(f"❌ Error leyendo CSV: {e}")
-        return
-
-    # Convertir coordenadas
-    df['lat'] = pd.to_numeric(df['lat'], errors='coerce')
-    df['lon'] = pd.to_numeric(df['lon'], errors='coerce')
-    df = df.dropna(subset=['lat', 'lon'])
-    
-    print(f"   📊 Locales válidos: {len(df):,}")
-
-    # 3. ENRIQUECIMIENTO
-    print("   ⬡ Calculando H3 y Categorías...")
-    df['h3_index'] = df.apply(lambda x: h3.geo_to_h3(x['lat'], x['lon'], H3_RES), axis=1)
-    df['category_group'] = df.apply(categorize_activity, axis=1)
-    df['is_active'] = df['desc_situacion_local'].str.contains('Abierto', case=False, na=False).astype(int)
-
-    # 4. GESTIÓN INTELIGENTE DEL HISTÓRICO (AQUÍ ESTÁ LA MAGIA)
+def update_enriched_layer():
+    print("🔄 ACTUALIZANDO CAPA MAESTRA (Vía Spatial Join PostGIS)...")
     engine = create_engine(DB_URL)
-    
-    # Obtener fecha del snapshot actual (del archivo o del día)
-    if 'snapshot_date' in df.columns:
-        current_snapshot = df['snapshot_date'].iloc[0] 
-    else:
-        current_snapshot = pd.Timestamp.now().strftime('%Y-%m-%d')
-        df['snapshot_date'] = current_snapshot
 
-    print(f"   📅 Gestionando Snapshot: {current_snapshot}")
-
-    with engine.connect() as conn:
-        # A. Verificar si la tabla existe (para no fallar en el SELECT)
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS locales_madrid_history (
-                id_local TEXT,
-                h3_index TEXT,
-                snapshot_date DATE,
-                desc_situacion_local TEXT,
-                category_group TEXT,
-                rotulo TEXT,
-                lat FLOAT,
-                lon FLOAT
-            );
-        """))
+    # 1. OBTENER EL ÚLTIMO SNAPSHOT
+    print("    📅 Buscando la fecha más reciente en 'locales_madrid_history'...")
+    try:
+        query_date = "SELECT MAX(snapshot_date) FROM locales_madrid_history"
+        latest_date = pd.read_sql(query_date, engine).iloc[0, 0]
         
-        # B. Contar si hay registros de esta misma fecha
-        result = conn.execute(text(f"SELECT COUNT(*) FROM locales_madrid_history WHERE snapshot_date = '{current_snapshot}'"))
-        count = result.scalar()
-        
-        if count > 0:
-            print(f"      ⚠️ Detectados {count} registros previos de {current_snapshot}.")
-            print("      🔄 Borrando versión anterior para re-emplazar (Clean Update)...")
-            conn.execute(text(f"DELETE FROM locales_madrid_history WHERE snapshot_date = '{current_snapshot}'"))
-            conn.commit()
-        else:
-            print("      ✅ Fecha nueva. Preparando inserción limpia.")
+        if not latest_date:
+            print("❌ ERROR: La tabla histórica está vacía.")
+            return
+            
+        print(f"       -> Último snapshot: {latest_date}")
+    except Exception as e:
+        print(f"❌ Error conectando a BBDD: {e}")
+        return
 
-    # 5. INSERTAR (APPEND SEGURO)
-    print("   💾 Insertando datos en 'locales_madrid_history'...")
+    # 2. SPATIAL JOIN (CRUCE ESPACIAL EN BBDD)
+    # Aquí ocurre la magia: Cruzamos puntos (L) con polígonos (H) usando ST_Intersects
+    print("    ⚔️  Ejecutando cruce espacial (Puntos vs Hexágonos)...")
     
-    # Columnas a guardar
-    cols_to_save = ['id_local', 'h3_index', 'snapshot_date', 'desc_situacion_local', 'category_group', 'rotulo', 'lat', 'lon']
-    # Filtramos solo las que existen por si acaso
-    final_cols = [c for c in cols_to_save if c in df.columns]
+    query_spatial_join = f"""
+        SELECT 
+            h.h3_index,                 -- El ID viene del hexágono donde cae el punto
+            l.id_local, 
+            l.desc_situacion_local, 
+            l.category_group 
+        FROM locales_madrid_history l
+        JOIN retail_hexagons_enriched h
+          ON ST_Intersects(l.geometry, h.geometry) -- Condición espacial
+        WHERE l.snapshot_date = '{latest_date}'
+    """
     
-    df_hist = df[final_cols].copy()
+    try:
+        df = pd.read_sql(query_spatial_join, engine)
+    except Exception as e:
+        print(f"    ❌ Error en el cruce espacial: {e}")
+        print("       SUGERENCIA: Asegúrate de que ambas tablas tienen columna 'geometry' y el mismo SRID (4326).")
+        return
     
-    # Usamos chunksize para no saturar la memoria
-    df_hist.to_sql('locales_madrid_history', engine, if_exists='append', index=False, chunksize=10000)
+    if df.empty:
+        print("    ⚠️ ALERTA: El cruce espacial no devolvió resultados.")
+        print("       Verifica que los hexágonos cubran la zona de los puntos.")
+        return
 
-    # 6. AGREGACIÓN Y UPDATE DE KPI (ENRICHED)
-    print("   ∑ Actualizando KPIs en tabla maestra...")
+    print(f"       -> {len(df):,} locales han sido asignados a un hexágono.")
+
+    # 3. RECALCULAR KPIS
+    print("    ∑  Recalculando métricas...")
     
+    # Normalizar estado (Abierto = 1)
+    df['is_active'] = df['desc_situacion_local'].astype(str).str.contains('Abierto', case=False, na=False).astype(int)
+    
+    # Agrupación por el h3_index que hemos recuperado del cruce
     stats = df.groupby('h3_index').agg(
         total_locales=('id_local', 'count'),
         active_locales=('is_active', 'sum'),
         cnt_fashion=('category_group', lambda x: (x == 'FASHION').sum()),
-        cnt_horeca=('category_group', lambda x: (x == 'HORECA').sum())
+        cnt_horeca=('category_group', lambda x: (x == 'HORECA').sum()),
+        cnt_wellness=('category_group', lambda x: (x == 'WELLNESS').sum())
     ).reset_index()
     
-    stats['vacancy_rate'] = 1 - (stats['active_locales'] / stats['total_locales'])
+    # Ratios
+    stats['vacancy_rate'] = 0.0
+    mask_vals = stats['total_locales'] > 0
+    stats.loc[mask_vals, 'vacancy_rate'] = 1 - (stats.loc[mask_vals, 'active_locales'] / stats.loc[mask_vals, 'total_locales'])
     
-    stats.to_sql('temp_madrid_kpis', engine, if_exists='replace', index=False)
+    print(f"       -> KPIs listos para {len(stats):,} hexágonos.")
+
+    # 4. ACTUALIZAR BBDD
+    print("    💾 Volcando datos a 'retail_hexagons_enriched'...")
+    
+    stats.to_sql('temp_kpi_update', engine, if_exists='replace', index=False)
     
     with engine.connect() as conn:
-        # Asegurar columnas
+        # Añadimos columnas si faltan
         conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS comm_density INT DEFAULT 0;"))
         conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS vacancy_rate FLOAT DEFAULT 0;"))
         conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS fashion_count INT DEFAULT 0;"))
         conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS horeca_count INT DEFAULT 0;"))
-        
-        # Update
+        conn.commit()
+
+        # Reseteamos valores a 0 antes de actualizar (opcional, para limpiar zonas que ahora no tienen locales)
+        # conn.execute(text("UPDATE retail_hexagons_enriched SET comm_density=0, vacancy_rate=0, fashion_count=0, horeca_count=0;"))
+
+        print("       -> Ejecutando UPDATE masivo...")
         conn.execute(text("""
             UPDATE retail_hexagons_enriched AS m
             SET comm_density = s.total_locales,
                 vacancy_rate = s.vacancy_rate,
                 fashion_count = s.cnt_fashion,
                 horeca_count = s.cnt_horeca
-            FROM temp_madrid_kpis AS s
+            FROM temp_kpi_update AS s
             WHERE m.h3_index = s.h3_index;
         """))
-        conn.execute(text("DROP TABLE temp_madrid_kpis;"))
+        
+        conn.execute(text("DROP TABLE temp_kpi_update;"))
         conn.commit()
 
-    print("✅ PROCESO COMPLETADO. Histórico limpio y KPIs actualizados.")
+    print("✅ PROCESO COMPLETADO. Capa sincronizada mediante cruce espacial.")
+    
+    top_dens = stats.sort_values('total_locales', ascending=False).head(1)
+    if not top_dens.empty:
+        print(f"    🏆 Zona más densa: {top_dens.iloc[0]['h3_index']} ({top_dens.iloc[0]['total_locales']} locales)")
 
 if __name__ == "__main__":
-    process_madrid_master()
+    update_enriched_layer()
