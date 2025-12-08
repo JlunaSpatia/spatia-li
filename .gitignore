@@ -248,3 +248,44 @@ changes*.json
 # PRECAUCIÓN: No uses *.json solo, o ignorarás archivos importantes como package.json
 data/export_shp/madrid_master_census_v2.shp.DESKTOP-60BPKUD.8468.20680.sr.lock
 data/export_shp/madrid_master_census_v3.shp.DESKTOP-60BPKUD.8468.20680.sr.lock
+lastablas_FULL_RAW_20251208_100312.json
+LASTABLAS_GRID_TEST_20251208_1025.json
+LASTABLAS_MASTER_CLEAN.json
+market_scanner/config.py
+
+
+# 1. Ir a la raíz
+cd ~/spatia-li
+
+# 2. Añadir las reglas al final del archivo .gitignore
+# (Si no existe el archivo, este comando lo crea)
+cat <<EOT >> .gitignore
+
+# --- RETAIL GENOME: SEGURIDAD Y DATOS ---
+
+# 1. IGNORAR SECRETOS (CRÍTICO)
+# Evita que se suba tu API Key
+market_scanner/config.py
+
+# 2. IGNORAR DATOS MASIVOS
+# Evita subir los JSON de 100MB y los CSVs
+market_scanner/data/
+market_scanner/output_shapefiles/
+market_scanner/shapefiles_output/
+
+# 3. IGNORAR ARCHIVOS TEMPORALES DEL ESCÁNER
+# Checkpoints y logs de progreso
+market_scanner/*_checkpoint.json
+market_scanner/*_FULL_RAW.json
+market_scanner/*_MASTER.json
+market_scanner/*.csv
+market_scanner/*.shp
+market_scanner/*.shx
+market_scanner/*.dbf
+market_scanner/*.cpg
+market_scanner/*.prj
+
+# 4. BASURA DE PYTHON (Estándar)
+__pycache__/
+*.pyc
+EOT
