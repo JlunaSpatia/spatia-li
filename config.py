@@ -4,8 +4,7 @@
 # Lista de ciudades a procesar.
 # Formato: "NombreCiudad, País" (para que OSMnx no se confunda con Córdoba, Argentina)
 TARGET_CITIES = [
-    "Madrid, Spain",
-   "Alcalá de Henares, Spain"
+    "Madrid, Spain"
 ]
 
 # --- 2. PARÁMETROS TÉCNICOS ---

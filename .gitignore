@@ -290,3 +290,4 @@ __pycache__/
 *.pyc
 EOT
 market_scanner/cache/MADRID_SMART_GRID.json
+etl/final_dataset.csv

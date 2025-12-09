@@ -2,95 +2,114 @@ import pandas as pd
 import geopandas as gpd
 from sqlalchemy import create_engine, text
 import os
+import sys
 import warnings
 import numpy as np
 
 # --- CONFIGURACIÓN ---
-DB_URL = "postgresql://postgres:postgres@localhost:5432/spatia"
+# Importamos variables del config
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+try:
+    from config import DB_CONNECTION_STR
+except ImportError:
+    DB_CONNECTION_STR = "postgresql://postgres:postgres@localhost:5432/spatia"
 
-# Rutas de tus archivos
-SHP_PATH = "data/raw/SECC_CE_20230101.shp"
-CSV_MADRID = "data/raw/ADHR_Madrid.csv"
-CSV_VALENCIA = "data/raw/ADHR_Valencia.csv"
+# Definimos rutas absolutas para robustez
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) # ~/spatia-li/
+DATA_RAW = os.path.join(BASE_DIR, "data", "raw")
+
+SHP_PATH = os.path.join(DATA_RAW, "SECC_CE_20230101.shp")
+# Nota: Si tienes un solo CSV maestro o varios, ajusta aquí.
+# Asumo que pueden existir o no, así que los listo.
+POSSIBLE_CSVS = [
+    os.path.join(DATA_RAW, "ADHR_Madrid.csv"),
+    os.path.join(DATA_RAW, "ADHR_Valencia.csv")
+]
 
 warnings.filterwarnings("ignore")
 
 def clean_ine_csv(path):
-    print(f"   🧹 Procesando archivo: {path}...")
+    print(f"   🧹 Procesando archivo: {os.path.basename(path)}...")
     
     if not os.path.exists(path):
-        print(f"      ❌ ERROR: No encuentro el archivo {path}")
+        # No es error crítico, quizás solo estamos procesando Madrid y no tenemos Valencia aún
+        print(f"      ℹ️ Info: No encuentro {os.path.basename(path)}, saltando.")
         return pd.DataFrame()
 
     try:
-        # 1. LECTURA (Separador ;)
+        # 1. LECTURA
         df = pd.read_csv(path, sep=';', encoding='utf-8', dtype=str)
-        df.columns = df.columns.str.strip() # Limpiar nombres de columnas
+        df.columns = df.columns.str.strip() 
         
-        # 2. FILTROS ESTRICTOS
-        # Eliminamos filas sin sección
+        # 2. FILTROS
+        if 'Secciones' not in df.columns:
+            # A veces el INE cambia cabeceras. Chequeo básico.
+            print("      ❌ Error: Columna 'Secciones' no encontrada.")
+            return pd.DataFrame()
+
         df = df[df['Secciones'].notna()]
         
-        # A. FILTRO INDICADOR: "Renta bruta media por hogar"
+        # Filtro Indicador
         target_indicator = "Renta bruta media por hogar"
         mask_indicador = df['Indicadores de renta media y mediana'].str.contains(target_indicator, case=False, na=False)
         
-        # B. FILTRO PERIODO: Año más reciente
+        # Filtro Periodo (Max Year)
         periodos = pd.to_numeric(df['Periodo'], errors='coerce')
         target_year = periodos.max()
         mask_periodo = periodos == target_year
         
-        # Aplicamos filtros
         df_clean = df[mask_indicador & mask_periodo].copy()
         
-        print(f"      -> Filtros: '{target_indicator}' | Año {int(target_year)}")
-        print(f"      -> Datos encontrados: {len(df_clean)} secciones")
+        print(f"      -> Datos del año {int(target_year)}: {len(df_clean)} secciones")
 
-        if df_clean.empty:
-            print("      ⚠️ AVISO: No se han encontrado datos. Revisa el CSV.")
-            return pd.DataFrame()
+        if df_clean.empty: return pd.DataFrame()
 
-        # 3. LIMPIEZA DE VALORES
+        # 3. LIMPIEZA VALORES
         def clean_currency(x):
             if pd.isna(x): return 0.0
             clean_str = str(x).replace('.', '').replace(',', '.')
-            try:
-                return float(clean_str)
-            except:
-                return 0.0
+            try: return float(clean_str)
+            except: return 0.0
 
         df_clean['renta'] = df_clean['Total'].apply(clean_currency)
         
-        # 4. LIMPIEZA DE CÓDIGO (CUSEC - 10 dígitos)
-        df_clean['CUSEC'] = df_clean['Secciones'].astype(str).str[:10]
+        # 4. LIMPIEZA CÓDIGO (CUSEC)
+        # El INE a veces pone el código completo, cogemos los primeros 10 chars que son el CUSEC estándar
+        df_clean['CUSEC'] = df_clean['Secciones'].astype(str).str.strip().str[:10]
         
-        # Eliminar rentas 0
-        df_final = df_clean[df_clean['renta'] > 0][['CUSEC', 'renta']]
-        
-        return df_final
+        # Filtrar rentas válidas
+        return df_clean[df_clean['renta'] > 0][['CUSEC', 'renta']]
 
     except Exception as e:
         print(f"      ❌ Error leyendo CSV: {e}")
         return pd.DataFrame()
 
 def spatial_interpolation(hex_gdf, census_gdf, value_col):
-    print("   ✂️  Cruzando geometrías (Interpolación Areal)...")
+    print("   ✂️ Cruzando geometrías (Interpolación Areal)...")
     
-    # Proyectar a UTM 30N (Metros)
-    hex_gdf = hex_gdf.to_crs(epsg=25830)
-    census_gdf = census_gdf.to_crs(epsg=25830)
+    # Proyección a Metros (UTM 30N - España Peninsular)
+    # Es vital para calcular áreas correctamente
+    target_crs = "EPSG:25830"
+    hex_gdf = hex_gdf.to_crs(target_crs)
+    census_gdf = census_gdf.to_crs(target_crs)
     
+    # Area original del hexágono (para calcular % de solape)
     hex_gdf['area_hex'] = hex_gdf.geometry.area
     
-    # Intersección
+    # Intersección (Hexágono "recortado" por la sección censal)
     overlay = gpd.overlay(hex_gdf, census_gdf, how='intersection')
     
-    # Peso ponderado
+    # Cálculo del peso: ¿Qué % del hexágono ocupa este trozo de sección?
     overlay['weight'] = overlay.geometry.area / overlay['area_hex']
+    
+    # Valor ponderado: Si el hexágono toca un 10% de un barrio rico, coge el 10% de esa renta
+    # NOTA: Para Renta Media, esto es una aproximación. Lo ideal es Population Weighted, 
+    # pero Areal Weighted es el estándar de industria para MVP.
     overlay['weighted_val'] = overlay[value_col] * overlay['weight']
     
-    # Agrupar
-    print("   ∑  Agrupando resultados...")
+    print("   ∑ Agrupando resultados...")
+    # Sumamos los trozos para reconstruir el valor del hexágono completo
+    # OJO: Al ser Renta MEDIA, la suma ponderada funciona si asumimos distribución homogénea
     result = overlay.groupby('h3_index')['weighted_val'].sum().reset_index()
     result.rename(columns={'weighted_val': 'avg_income'}, inplace=True)
     
@@ -98,89 +117,93 @@ def spatial_interpolation(hex_gdf, census_gdf, value_col):
 
 def enrich_demographics():
     print("💶 PASO 03: INTEGRACIÓN DE RENTA (INE)...")
-    engine = create_engine(DB_URL)
+    engine = create_engine(DB_CONNECTION_STR)
     
-    # 1. CARGAR DATOS
-    df_mad = clean_ine_csv(CSV_MADRID)
-    df_val = clean_ine_csv(CSV_VALENCIA)
+    # 1. CARGAR DATOS INE
+    dfs = []
+    for csv_path in POSSIBLE_CSVS:
+        df_temp = clean_ine_csv(csv_path)
+        if not df_temp.empty:
+            dfs.append(df_temp)
     
-    if df_mad.empty and df_val.empty:
-        print("❌ ERROR: No hay datos válidos. Abortando.")
+    if not dfs:
+        print("❌ ERROR: No se cargó ningún dato de renta válido.")
         return
 
-    df_renta_total = pd.concat([df_mad, df_val])
+    df_renta_total = pd.concat(dfs)
     
-    # 2. CARGAR MAPA
+    # 2. CARGAR MAPA SHAPEFILE
     if not os.path.exists(SHP_PATH):
-        print(f"❌ ERROR: Falta mapa {SHP_PATH}")
+        print(f"❌ ERROR CRÍTICO: No encuentro el mapa censal en {SHP_PATH}")
         return
         
-    print("   🗺️  Leyendo mapa censal...")
+    print("   🗺️ Leyendo mapa censal (Shapefile)...")
     gdf_mapa = gpd.read_file(SHP_PATH)
+    # Asegurar que CUSEC sea string limpio para el join
     gdf_mapa['CUSEC'] = gdf_mapa['CUSEC'].astype(str).str.strip()
     
-    # 3. JOIN
-    print("   🔗 Uniendo Datos + Mapa...")
+    # 3. JOIN (Dato + Mapa)
+    print("   🔗 Uniendo Tabla Renta + Mapa Geográfico...")
     gdf_census_full = gdf_mapa.merge(df_renta_total, on='CUSEC', how='inner')
-    print(f"      -> Secciones con datos geográficos: {len(gdf_census_full)}")
+    print(f"      -> Secciones con renta mapeada: {len(gdf_census_full)}")
     
     if len(gdf_census_full) == 0:
+        print("⚠️ ALERTA: El cruce ha dado 0 resultados. Revisa que los códigos CUSEC coincidan.")
         return
 
-    # 4. CARGAR HEXÁGONOS
-    print("   ⬡  Leyendo hexágonos de PostGIS...")
-    sql = "SELECT h3_index, geometry FROM retail_hexagons"
-    gdf_hex = gpd.read_postgis(sql, engine, geom_col='geometry')
+    # 4. CARGAR HEXÁGONOS (Desde PostGIS)
+    print("   ⬡ Leyendo hexágonos de PostGIS...")
+    try:
+        sql = "SELECT h3_index, geometry FROM retail_hexagons"
+        gdf_hex = gpd.read_postgis(sql, engine, geom_col='geometry')
+    except Exception as e:
+        print(f"❌ Error leyendo PostGIS: {e}")
+        return
     
     # 5. INTERPOLACIÓN
     df_income_final = spatial_interpolation(gdf_hex, gdf_census_full, 'renta')
     
-    # 6. GUARDAR (SINCRONIZAR + ACTUALIZAR)
+    # 6. GUARDAR Y SINCRONIZAR
     print("💾 Guardando Renta en BBDD...")
     
-    # Subir datos nuevos a una tabla temporal
     df_income_final.to_sql('temp_income', engine, if_exists='replace', index=False)
     
-    with engine.connect() as conn:
-        # A. Inicializar tabla 'retail_hexagons_enriched' si no existe
-        print("      -> Verificando estructura de tablas...")
+    # Usamos transaction block para seguridad
+    with engine.begin() as conn:
+        # A. Crear Master Table si no existe
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS retail_hexagons_enriched AS 
-            SELECT * FROM retail_hexagons;
+            SELECT * FROM retail_hexagons WHERE 1=0;
         """))
+        # (El WHERE 1=0 crea la estructura vacía si no existe, luego rellenamos)
         
-        # B. SINCRONIZAR HEXÁGONOS NUEVOS (La corrección clave)
-        # Si hemos añadido una ciudad nueva en el paso 01, sus hexágonos existen en 'retail_hexagons'
-        # pero no en 'retail_hexagons_enriched'. Aquí los insertamos.
+        # B. Sincronizar Nuevos Hexágonos (Insertar los que falten desde la base)
         print("      -> Sincronizando nuevos territorios...")
         conn.execute(text("""
-            INSERT INTO retail_hexagons_enriched (h3_index, city, geometry, dist_cafe, dist_gym, dist_shop, dist_transit, lat, lon)
-            SELECT h3_index, city, geometry, dist_cafe, dist_gym, dist_shop, dist_transit, lat, lon
-            FROM retail_hexagons
-            WHERE h3_index NOT IN (SELECT h3_index FROM retail_hexagons_enriched);
+            INSERT INTO retail_hexagons_enriched (h3_index, geometry, city, lat, lon, dist_cafe, dist_gym, dist_shop, dist_transit)
+            SELECT h.h3_index, h.geometry, h.city, h.lat, h.lon, h.dist_cafe, h.dist_gym, h.dist_shop, h.dist_transit
+            FROM retail_hexagons h
+            WHERE NOT EXISTS (
+                SELECT 1 FROM retail_hexagons_enriched e WHERE e.h3_index = h.h3_index
+            );
         """))
 
-        # C. Asegurar que la columna 'avg_income' existe
+        # C. Añadir columna Renta
         conn.execute(text("ALTER TABLE retail_hexagons_enriched ADD COLUMN IF NOT EXISTS avg_income FLOAT;"))
         
-        # D. Crear índices
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_enriched_h3 ON retail_hexagons_enriched(h3_index);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_temp_income_h3 ON temp_income(h3_index);"))
-
-        # E. Update masivo
-        print("      -> Ejecutando UPDATE SQL...")
+        # D. Update Masivo
+        print("      -> Actualizando valores de renta...")
         conn.execute(text("""
-            UPDATE retail_hexagons_enriched AS m
-            SET avg_income = s.avg_income
-            FROM temp_income AS s
-            WHERE m.h3_index = s.h3_index;
+            UPDATE retail_hexagons_enriched m
+            SET avg_income = t.avg_income
+            FROM temp_income t
+            WHERE m.h3_index = t.h3_index;
         """))
         
-        # F. Limpieza
+        # E. Limpieza
         conn.execute(text("DROP TABLE temp_income;"))
-        conn.commit()
         
-    print("✅ ¡RENTA INTEGRADA Y SINCRONIZADA!")
+    print("✅ ¡RENTA INTEGRADA CORRECTAMENTE!")
     print(df_income_final.sort_values('avg_income', ascending=False).head(3))
 
 if __name__ == "__main__":
