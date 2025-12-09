@@ -14,3 +14,6 @@
 🐕 WATCHDOG: Revisando estado del sistema...
    ⚠️ Se han detectado 2 tareas pendientes.
    ✅ Alerta enviada a Telegram.
+🐕 WATCHDOG: Revisando estado del sistema...
+   ⚠️ Se han detectado 2 tareas pendientes.
+   ✅ Alerta enviada a Telegram.

@@ -289,3 +289,4 @@ market_scanner/*.prj
 __pycache__/
 *.pyc
 EOT
+market_scanner/cache/MADRID_SMART_GRID.json
