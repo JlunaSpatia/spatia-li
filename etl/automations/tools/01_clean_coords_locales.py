@@ -6,6 +6,28 @@ import warnings
 import logging
 from sqlalchemy import create_engine, text
 
+# archivo: etl/03_enrich_Demo.py
+import sys
+
+
+# --- Truco para importar utils desde la carpeta padre ---
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils import log_execution 
+
+# Aquí viene la magia:
+# El número (3) es el ID de la tarea en tu base de datos
+@log_execution(task_id=3)
+def main():
+    print("Iniciando proceso de enriquecimiento...")
+    # ...
+    # AQUÍ TU LÓGICA DE PANDAS, ETC.
+    # ...
+    print("Proceso terminado")
+    return "Se procesaron 500 filas." # Esto se guardará en el log
+
+if __name__ == "__main__":
+    main()
+
 # --- CONFIGURACIÓN ---
 FILE_LOCALES_RAW = "data/raw/locales202512.csv"
 FILE_ACTIVIDAD_RAW = "data/raw/actividadeconomica202512.csv"

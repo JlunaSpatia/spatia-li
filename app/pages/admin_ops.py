@@ -1,146 +1,230 @@
 import streamlit as st
 import pandas as pd
 import subprocess
-from sqlalchemy import create_engine, text
+import signal
 import datetime
 import os
+import sys
+import time
+from sqlalchemy import create_engine, text
 
-# --- CONFIG ---
+# ==========================================
+# 1. SETUP DE RUTAS Y CONFIGURACIÓN
+# ==========================================
+# Tu archivo está en: .../spatia-li/app/pages/admin_ops.py
+
+current_dir = os.path.dirname(os.path.abspath(__file__)) # .../pages
+app_dir = os.path.dirname(current_dir)                   # .../app
+project_root = os.path.dirname(app_dir)                  # .../spatia-li (RAÍZ REAL)
+
+# Añadimos la raíz al sistema para poder importar config y utils
+sys.path.append(project_root)
+
+# Importamos la configuración centralizada
+try:
+    from config import DB_CONNECTION_STR, ACTIVE_CITIES
+except ImportError:
+    st.error(f"❌ Error Crítico: No encuentro 'config.py'.\nBuscando en: {project_root}")
+    st.stop()
+
+# Configuración visual de Streamlit
 st.set_page_config(page_title="Ops Control Center", page_icon="🎛️", layout="wide")
-DB_URL = "postgresql://postgres:postgres@localhost:5432/spatia"
 
-# CSS para estados
+# Inicializar estado para procesos en segundo plano
+if 'running_tasks' not in st.session_state:
+    st.session_state.running_tasks = {}
+
+# Estilos CSS
 st.markdown("""
 <style>
-    .status-box {padding: 10px; border-radius: 5px; margin-bottom: 10px; font-weight: bold;}
-    .due {background-color: #ffcccb; color: #8b0000; border: 1px solid #8b0000;}
-    .done {background-color: #d4edda; color: #155724; border: 1px solid #155724;}
-    .btn-run {width: 100%;}
+    .status-box { padding: 8px; border-radius: 5px; text-align: center; font-weight: bold; font-size: 0.9em;}
+    .due { background-color: #ffebe9; color: #cf222e; border: 1px solid #cf222e; }
+    .done { background-color: #dafbe1; color: #1a7f37; border: 1px solid #1a7f37; }
+    .running { background-color: #e0f2fe; color: #0284c7; border: 1px solid #0284c7; animation: pulse 2s infinite;}
+    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
+    div.stButton > button {width: 100%;}
 </style>
 """, unsafe_allow_html=True)
 
+# ==========================================
+# 2. LÓGICA DE BACKEND
+# ==========================================
 def get_engine():
-    return create_engine(DB_URL)
+    return create_engine(DB_CONNECTION_STR)
 
-def get_tasks_status():
-    """Calcula qué tareas tocan hoy basándose en la última ejecución"""
-    engine = get_engine()
-    
-    # Query maestra: Une Definiciones con la Última Ejecución Exitosa
-    sql = """
-    SELECT 
-        d.task_id, d.task_name, d.script_path, d.frequency_days, d.description,
-        MAX(h.run_date) as last_run
-    FROM etl_definitions d
-    LEFT JOIN etl_history h ON d.task_id = h.task_id AND h.status = 'SUCCESS'
-    GROUP BY d.task_id, d.task_name, d.script_path, d.frequency_days, d.description
-    ORDER BY d.task_id ASC;
+def get_smart_status():
     """
-    return pd.read_sql(sql, engine)
-
-def run_script(task_id, script_path):
-    """Ejecuta el script python y guarda el log"""
+    Construye la tabla de tareas combinando:
+    - Tareas Globales (1 fila única)
+    - Tareas Multi-Ciudad (1 fila por cada ciudad en ACTIVE_CITIES)
+    """
     engine = get_engine()
+    # Leemos la definición de tareas
+    definitions = pd.read_sql("SELECT * FROM etl_definitions ORDER BY task_id", engine)
     
-    # Verificar existencia
-    if not os.path.exists(script_path):
-        return False, f"❌ Archivo no encontrado: {script_path}"
+    rows = []
     
+    for _, task in definitions.iterrows():
+        tid = task['task_id']
+        
+        # --- LÓGICA: ¿Es una tarea por ciudad? (Ej: ID 30) ---
+        MULTI_CITY_TASKS = [30] 
+        
+        if tid in MULTI_CITY_TASKS:
+            for city in ACTIVE_CITIES:
+                sql = text("""
+                    SELECT MAX(run_date) FROM etl_history 
+                    WHERE task_id = :tid AND scope = :city AND status = 'SUCCESS'
+                """)
+                with engine.connect() as conn:
+                    last_run = conn.execute(sql, {"tid": tid, "city": city}).scalar()
+                
+                rows.append({
+                    "unique_id": f"{tid}_{city}",
+                    "task_id": tid,
+                    "display_name": f"{task['task_name']} ({city})",
+                    "scope": city,
+                    "desc": task['description'],
+                    "freq": task['frequency_days'],
+                    "last_run": last_run,
+                    "script_path": task['script_path']
+                })
+
+        else:
+            # --- Tareas Globales ---
+            sql = text("""
+                SELECT MAX(run_date) FROM etl_history 
+                WHERE task_id = :tid 
+                AND (scope = 'GLOBAL' OR scope = 'GLOBAL_RELEASE') 
+                AND status = 'SUCCESS'
+            """)
+            with engine.connect() as conn:
+                last_run = conn.execute(sql, {"tid": tid}).scalar()
+            
+            rows.append({
+                "unique_id": f"{tid}_GLB",
+                "task_id": tid,
+                "display_name": task['task_name'],
+                "scope": "GLOBAL_RELEASE", 
+                "desc": task['description'],
+                "freq": task['frequency_days'],
+                "last_run": last_run,
+                "script_path": task['script_path']
+            })
+            
+    return pd.DataFrame(rows)
+
+def start_task(unique_id, task_id, script_rel_path, scope_arg):
+    """Lanza el script en segundo plano sin bloquear la App"""
+    
+    full_path = os.path.join(project_root, script_rel_path)
+    
+    if not os.path.exists(full_path):
+        st.toast(f"❌ Error: No encuentro el script en {full_path}", icon="🔥")
+        return
+
+    cmd = ["python", full_path]
+    if scope_arg:
+        cmd.append(scope_arg)
+
     try:
-        # Ejecución real
-        result = subprocess.run(
-            ["python", script_path],
-            capture_output=True,
+        env = os.environ.copy()
+        env["PYTHONPATH"] = project_root + os.pathsep + env.get("PYTHONPATH", "")
+        
+        proc = subprocess.Popen(
+            cmd, 
+            cwd=project_root,
+            env=env,
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
             text=True,
-            check=True
+            preexec_fn=os.setsid
         )
-        status = "SUCCESS"
-        log = result.stdout
-        is_ok = True
+        st.session_state.running_tasks[unique_id] = {'proc': proc, 'start': datetime.datetime.now()}
+        st.rerun()
         
-    except subprocess.CalledProcessError as e:
-        status = "ERROR"
-        log = e.stdout + "\n" + e.stderr
-        is_ok = False
-        
-    # Guardar en Historial
-    with engine.connect() as conn:
-        conn.execute(text("""
-            INSERT INTO etl_history (task_id, status, log_output) 
-            VALUES (:tid, :st, :log)
-        """), {"tid": task_id, "st": status, "log": log})
-        conn.commit()
-        
-    return is_ok, log
+    except Exception as e:
+        st.error(f"Fallo al arrancar el proceso: {e}")
 
-# --- INTERFAZ PRINCIPAL ---
-st.title("🎛️ Centro de Operaciones ETL")
-st.markdown("Gestión manual de procesos recurrentes y mantenimiento de datos.")
+def stop_task(unique_id):
+    if unique_id in st.session_state.running_tasks:
+        proc = st.session_state.running_tasks[unique_id]['proc']
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except: pass
+        del st.session_state.running_tasks[unique_id]
+        st.rerun()
 
-df_tasks = get_tasks_status()
+def check_tasks_status():
+    finished_ids = []
+    for uid, info in st.session_state.running_tasks.items():
+        if info['proc'].poll() is not None:
+            finished_ids.append(uid)
+            if info['proc'].returncode == 0:
+                st.toast(f"Tarea completada: {uid}", icon="✅")
+            else:
+                st.toast(f"Tarea falló: {uid}", icon="❌")
+    
+    if finished_ids:
+        for uid in finished_ids:
+            del st.session_state.running_tasks[uid]
+        st.rerun()
 
-# Iteramos por cada tarea para pintar su tarjeta
-for index, row in df_tasks.iterrows():
-    with st.container():
-        # Cálculo de estado
-        last_run = row['last_run']
-        freq = row['frequency_days']
-        
-        if pd.isna(last_run):
-            days_ago = 999
-            status_text = "NUNCA EJECUTADO"
+# ==========================================
+# 3. INTERFAZ DE USUARIO (UI)
+# ==========================================
+st.title("🎛️ Ops Center")
+st.caption(f"Proyecto Spatia | Entorno: {project_root}")
+st.divider()
+
+check_tasks_status()
+
+# Cargar tabla inteligente
+try:
+    df_tasks = get_smart_status()
+except Exception as e:
+    st.error(f"Error conectando a BBDD: {e}")
+    st.stop()
+
+for _, row in df_tasks.iterrows():
+    uid = row['unique_id']
+    is_running = uid in st.session_state.running_tasks
+    
+    # Semáforo
+    last = row['last_run']
+    if is_running:
+        status_html = '<div class="status-box running">⚙️ RUNNING</div>'
+    elif pd.isna(last):
+        status_html = '<div class="status-box never">⚪ NUNCA</div>'
+        is_due = True
+    else:
+        days = (datetime.datetime.now() - last).days
+        if days >= row['freq']:
+            status_html = f'<div class="status-box due">🔴 PENDIENTE ({days}d)</div>'
             is_due = True
         else:
-            days_ago = (datetime.datetime.now() - last_run).days
-            status_text = f"Hace {days_ago} días ({last_run.strftime('%Y-%m-%d')})"
-            is_due = days_ago >= freq
+            status_html = f'<div class="status-box done">🟢 AL DÍA ({days}d)</div>'
+            is_due = False
 
-        # Diseño de la Tarjeta (Columnas)
-        c1, c2, c3, c4, c5 = st.columns([0.5, 2, 1.5, 1.5, 1])
+    with st.container():
+        c1, c2, c3, c4 = st.columns([3, 1.5, 1.5, 1.5])
         
-        # 1. ID
-        c1.markdown(f"**#{row['task_id']}**")
+        c1.markdown(f"**{row['display_name']}**")
+        c1.caption(f"📝 {row['desc']}")
         
-        # 2. Nombre y Descripción
-        c2.markdown(f"**{row['task_name']}**")
-        c2.caption(row['description'])
+        c2.info(f"📅 Frec: {row['freq']} días")
+        c3.markdown(status_html, unsafe_allow_html=True)
         
-        # 3. Frecuencia
-        c3.text(f"📅 Cada {freq} días")
-        
-        # 4. Estado (Visual)
-        if is_due:
-            c4.markdown(f'<div class="status-box due">🔴 PENDIENTE<br><small>{status_text}</small></div>', unsafe_allow_html=True)
-        else:
-            c4.markdown(f'<div class="status-box done">🟢 AL DÍA<br><small>{status_text}</small></div>', unsafe_allow_html=True)
-            
-        # 5. BOTÓN DE ACCIÓN (RUN)
-        if c5.button("▶️ EJECUTAR", key=f"btn_{row['task_id']}", type="primary" if is_due else "secondary"):
-            
-            with st.status(f"Ejecutando: {row['task_name']}...", expanded=True) as status:
-                st.write("🚀 Iniciando proceso...")
-                st.code(f"python {row['script_path']}", language="bash")
-                
-                success, log = run_script(row['task_id'], row['script_path'])
-                
-                if success:
-                    status.update(label="✅ Completado con éxito!", state="complete", expanded=False)
-                    st.success("Proceso finalizado correctamente.")
-                    st.rerun() # Recargar para actualizar fechas
-                else:
-                    status.update(label="❌ Error en la ejecución", state="error")
-                    st.error("El script ha fallado. Revisa el log abajo.")
-                    st.text_area("Log de Error", log, height=200)
-
+        with c4:
+            st.write("")
+            if is_running:
+                st.button("⛔ STOP", key=f"stop_{uid}", type="primary", on_click=stop_task, args=(uid,))
+            else:
+                label = "▶️ RUN" if is_due else "🔄 RE-RUN"
+                st.button(label, key=f"run_{uid}", on_click=start_task, 
+                          args=(uid, row['task_id'], row['script_path'], row['scope']))
     st.divider()
 
-# --- SECCIÓN DE HISTORIAL ---
-with st.expander("📜 Ver Historial Completo de Ejecuciones"):
-    engine = get_engine()
-    history = pd.read_sql("""
-        SELECT h.run_date, d.task_name, h.status, LEFT(h.log_output, 100) as log_preview
-        FROM etl_history h
-        JOIN etl_definitions d ON h.task_id = d.task_id
-        ORDER BY h.run_date DESC LIMIT 50
-    """, engine)
-    st.dataframe(history, use_container_width=True)
+if st.session_state.running_tasks:
+    time.sleep(2)
+    st.rerun()

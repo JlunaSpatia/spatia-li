@@ -5,6 +5,12 @@ import os
 import numpy as np
 from datetime import datetime
 import config  # Importamos tu configuración
+# archivo: etl/03_enrich_Demo.py
+import sys
+
+
+
+
 
 # --- GESTIÓN DE LA MALLA (SMART vs MATH) ---
 def get_grid_points(city_name, city_conf):
