@@ -1,155 +1,149 @@
-# 🗄️ GOBERNANZA DE DATOS: MANTENIMIENTO (STOCKPILING)
+# 🗄️ GOBERNANZA DE DATOS: MANTENIMIENTO Y OPERACIONES
 
-**Versión:** 1.2 (Final MVP)  
-**Estrategia:** "Data Lake Freshness"  
+**Versión:** 2.0 (Architecture Refactor)  
+**Estrategia:** "Decoupled Ingestion & Compute"  
 **Owner:** Jesús Luna  
 
-El objetivo de este plan es asegurar que la base de datos contiene la información más reciente disponible (Stockpiling). **NO ejecutamos el modelo de IA en estas tareas**, solo mantenemos la materia prima fresca y lista para cuando se requiera un estudio.
+Este documento define los procedimientos para mantener el **Data Lake** de Spatia actualizado.  
+La arquitectura se ha dividido en dos fases para permitir escalabilidad multi-ciudad:
+
+1.  **Ingest (Data Lake):** Procesos I/O Bound (Descargas, Scraping, Verificación de ficheros).
+2.  **Compute (Enrichment):** Procesos CPU Bound (Cruce geométrico, H3 Indexing, Interpolación).
 
 ---
 
-## 1. CALENDARIO DE INGESTA (DATA INGESTION SCHEDULE)
+## 1. CATÁLOGO DE PROCESOS (ETL DEFINITIONS)
 
-Tabla maestra de procesos definidos en PostgreSQL (`public.etl_definitions`).
+Los procesos están registrados en la base de datos (`etl_definitions`) y organizados físicamente en la carpeta `processes/`.
 
-| ID Tarea | Proceso | Frecuencia | Script / Path | Descripción |
-| :--- | :--- | :--- | :--- | :--- |
-| **1** | **Censo Madrid (Ayto)** | **30 días** (Mensual) | `etl/automations/tools/01_clean_coords_locales.py` | **Madrid Only.** Descarga automática del Portal de Datos Abiertos. Detecta cierres/aperturas oficiales. |
-| **2** | **Google Maps (Scanner)** | **90 días** (Trimestral) | `market_scanner/` | **CRÍTICO.** Barrido masivo de POIs vía ScrapingDog. Carga la materia prima de Lifestyle en `retail_poi_master`. |
-| **3** | **Renta INE** | **365 días** (Anual) | `etl/03_enrich_demog.py` | Ingesta de Renta Media por Sección Censal. Requiere descarga manual del CSV del INE. |
-| **4** | **WorldPop (Target)** | **365 días** (Anual) | `etl/04_enrich_target_pop.py` | Ingesta de bandas de edad (15-35). Requiere descarga manual de TIFs y pre-procesado. |
+| ID | Nombre Tarea | Tipo | Frecuencia | Script Path | Alcance (Scope) |
+|:---|:---|:---|:---|:---|:---|
+| **10** | **Ingesta INE (Censo)** | INGEST | 365 días | `processes/ingest/10_ingest_ine.py` | **GLOBAL** (Release anual) |
+| **20** | **Ingesta WorldPop** | INGEST | 365 días | `processes/ingest/20_ingest_worldpop.py` | **GLOBAL** (Release anual) |
+| **30** | **Scraping Google POIs** | INGEST | 90 días | `processes/ingest/30_scrape_poi.py` | **MULTI-CITY** (Por ciudad) |
+| **03** | **Enrich Income (Renta)** | COMPUTE | N/A* | `processes/compute/03_enrich_income.py` | On-Demand |
+| **04** | **Enrich Target (Jóvenes)** | COMPUTE | N/A* | `processes/compute/04_enrich_target_pop.py` | On-Demand |
+
+*\* Las tareas de cómputo se ejecutan tras una ingesta o al añadir una nueva ciudad.*
 
 ---
 
-## 2. PROCEDIMIENTOS DE ACTUALIZACIÓN PASO A PASO
+## 2. PROCEDIMIENTOS DE INGESTA (DATA INGEST)
 
-### A. Tarea 1: Censo de Locales Madrid (Mensual)
-*Fuente oficial del Ayuntamiento. Alta fiabilidad para licencias, baja frescura comercial.*
+Estos procesos traen el dato "crudo" a `data/raw`. Su misión es **disponibilidad**, no procesamiento.
 
-* **Objetivo:** Detectar "Locales Cerrados" y "Cambios de Actividad" oficiales en Madrid.
-* **Fuente:** [Datos Abiertos Madrid - Censo de Locales](https://datos.madrid.es/sites/v/index.jsp?vgnextoid=23160329ff639410VgnVCM2000000c205a0aRCRD&vgnextchannel=374512b9ace9f310VgnVCM100000171f5a0aRCRD).
+### A. Tarea 10: Ingesta INE (Manual Verificada)
+*Fuente anual irremplazable. Actualiza el semáforo global.*
+
+* **Objetivo:** Obtener el CSV maestro de Renta y el Shapefile censal.
+* **Procedimiento:**
+    1.  Ir a la web del INE (URL en el script).
+    2.  Descargar "Indicadores de renta media y mediana" (CSV separado por `;`).
+    3.  Guardar en `data/raw/` siguiendo el patrón: `INE_YYYY_Renta.csv` (ej: `INE_2024_Renta.csv`).
+    4.  **Ejecutar Verificación:**
+        ```bash
+        # Verifica que el archivo existe y actualiza la fecha en BBDD
+        python processes/ingest/10_ingest_ine.py GLOBAL_RELEASE
+        ```
+
+### B. Tarea 20: WorldPop (Automático)
+*Datos raster de población mundial.*
+
+* **Objetivo:** Descargar los `.tif` de población (100m grid).
 * **Ejecución:**
     ```bash
-    # El script descarga el CSV automáticamente si la URL no ha cambiado
-    python etl/automations/tools/01_clean_coords_locales.py
+    python processes/ingest/20_ingest_worldpop.py
     ```
 
-### B. Tarea 2: Google Points of Interest (Trimestral)
-*El pulso real del mercado. Cobertura Global. Es el input del "Vibe Score".*
+### C. Tarea 30: Google POIs (Scraping por Ciudad)
+*El pulso del mercado. Se ejecuta independientemente por ciudad.*
 
-* **Objetivo:** Tener la foto más reciente de aperturas, ratings y popularidad en `retail_poi_master`.
-* **Ejecución:**
-    1.  Ir al módulo de escaneo:
-        ```bash
-        cd market_scanner
-        ```
-    2.  Lanzar barrido (Coste de créditos API):
-        ```bash
-        python 01_fetch_city.py
-        ```
-    3.  Limpiar y fusionar duplicados:
-        ```bash
-        python 02_clean_and_merge.py
-        ```
-    4.  Cargar a PostGIS (Ingesta final):
-        ```bash
-        python 03_load_master_to_postgis.py
-        ```
-
-### C. Tarea 3: INE Renta (Anual)
-*Poder adquisitivo estructural.*
-
-* **Objetivo:** Actualizar la capa `avg_income` en los hexágonos enriquecidos.
-* **Fuente:** [INE - Atlas de Distribución de Renta de los Hogares](https://www.ine.es/dynt3/inebase/index.htm?padre=12385&capsel=12384).
-* **Ejecución:**
-    1.  **Manual:** Descargar el último CSV disponible (Separador `;`).
-    2.  Guardar en `data/raw/` (ej: `ADHR_2024.csv`).
-    3.  Lanzar script de cruce:
-        ```bash
-        python etl/03_enrich_demog.py
-        ```
-
-### D. Tarea 4: WorldPop Age Bands (Anual)
-*Masa crítica de target específico (Jóvenes 15-35).*
-
-* **Objetivo:** Actualizar la capa `target_pop` (población filtrada) en los hexágonos.
-* **Fuente:** [WorldPop Hub - Spain 100m](https://hub.worldpop.org/).
-* **Ejecución:**
-    1.  **Manual:** Descargar los nuevos `.tif` correspondientes a las franjas de edad y sexo deseadas.
-    2.  Guardar en `data/raw/worldpop_parts/`.
-    3.  Combinar las bandas en un solo raster:
-        ```bash
-        python etl/00_prep_worldpop.py
-        ```
-    4.  Inyectar en base de datos:
-        ```bash
-        python etl/04_enrich_target_pop.py
-        ```
+* **Objetivo:** Actualizar competidores y POIs en una ciudad específica.
+* **Gestión de Ciudades:** Las ciudades activas se definen en `config.py` dentro de la lista `ACTIVE_CITIES`.
+* **Ejecución Manual (Consola):**
+    ```bash
+    # Requiere argumento de ciudad
+    python processes/ingest/30_scrape_poi.py MADRID
+    python processes/ingest/30_scrape_poi.py VALENCIA
+    ```
+* **Nota:** Este proceso actualiza el semáforo específico de esa ciudad en el Ops Center, sin afectar a las demás.
 
 ---
 
-## 3. ¿Y EL MODELO? (EJECUCIÓN AD-HOC)
+## 3. PROCEDIMIENTOS DE CÓMPUTO (DATA ENRICHMENT)
 
-La inteligencia artificial (`scikit-learn`, `similarity`, `context-smoothing`) **NO** forma parte del mantenimiento rutinario. Es el **Producto**. Se ejecuta a demanda (On-Demand) cuando:
-1.  Entra un nuevo cliente.
-2.  Se requiere un estudio de expansión.
-3.  Se acaba de completar una carga trimestral de Google (Tarea 2) y queremos refrescar los mapas.
+Estos procesos leen los datos de `data/raw` y los cruzan con los hexágonos H3 en la base de datos (`retail_hexagons`).
 
-**Cadena de Mando (Pipeline de Inteligencia):**
+**¿Cuándo se ejecutan?**
+1.  Cuando hay una **Nueva Release Global** (ej: sale el dato INE 2025).
+2.  Cuando **añadimos una Nueva Ciudad** (ej: activamos Bilbao y queremos calcular sus datos con el fichero INE existente).
 
-```bash
-# 1. Calcular Vibe & Lifestyle (Usa datos frescos de Tarea 2)
-# Genera: score_hipster, score_retail, gravity_score
-python etl/05_enrich_floating_demand.py
+### A. Tarea 03: Enrich Income (Renta)
+* **Lógica:** Busca automáticamente el archivo `INE_*_Renta.csv` más reciente en `data/raw` y lo cruza espacialmente con **todos** los hexágonos de la BBDD.
+* **Comando:**
+    ```bash
+    python processes/compute/03_enrich_income.py
+    ```
 
-# 2. Propagar Contexto (Usa datos de Tareas 1, 3 y 4)
-# Genera: income_smooth, target_pop_smooth
-python etl/06_context_smoothing.py
+### B. Tarea 04: Enrich Target (Target Pop)
+* **Lógica:** Cruza los hexágonos con el Raster `.tif` de WorldPop para contar población joven (15-35 años).
+* **Comando:**
+    ```bash
+    python processes/compute/04_enrich_target_pop.py
+    ```
 
-# 3. Entrenar y Puntuar (El Cerebro)
-# Genera: similarity_final (0-100)
-python etl/07_train_model.py
+---
 
-# 4. Seleccionar Ganadores (Reporte Final)
-# Genera: Top 10 Locations independientes
-python etl/08_select_top_locations.py
+## 4. OPS CENTER (PANEL DE CONTROL)
 
-# 5. (Opcional) Análisis Financiero
-# Genera: opportunity_index (Score / Precio Alquiler)
-python etl/09_enrich_financial.py
+La gestión del día a día se realiza desde la aplicación visual, diseñada para entender la diferencia entre tareas globales y locales.
 
+* **Acceso:**
+    ```bash
+    streamlit run app/pages/admin_ops.py
+    ```
 
+### Semáforos Inteligentes 🚦
+El panel calcula el estado basándose en la columna `scope` del historial:
 
-## 7. SISTEMA DE OBSERVABILIDAD Y CONTROL (OPS CENTER)
+1.  **Tareas Globales (INE/WorldPop):**
+    * Miran solo ejecuciones con `scope='GLOBAL_RELEASE'` o `scope='GLOBAL'`.
+    * Ignoran parches locales (ej: si procesas solo un barrio nuevo).
+    * **Alerta:** Se pone rojo si hace > 365 días de la última descarga oficial.
 
-El sistema cuenta con una capa de gestión para evitar la "fatiga de scripts" y garantizar que los datos no caduquen silenciosamente.
+2.  **Tareas Multi-Ciudad (Google POIs):**
+    * Se genera dinámicamente una fila por cada ciudad en `config.py`.
+    * Miran ejecuciones con `scope='NOMBRE_CIUDAD'`.
+    * **Alerta:** Se pone rojo si hace > 90 días que no se escanea esa ciudad específica.
 
-### A. The Watchdog (Alerta Temprana)
-Un script autónomo que verifica la "frescura" de los datos contra la tabla `etl_definitions`.
+### Flujo de Trabajo Típico
 
-* **Script:** `etl/automations/watchdog.py`
-* **Frecuencia:** Ejecutar diariamente vía CRON (ej: 09:00 AM).
-* **Lógica:**
-    1.  Consulta la última fecha `SUCCESS` en `etl_history`.
-    2.  Compara con `frequency_days` de la definición.
-    3.  Si `(Hoy - Última Ejecución) > Frecuencia` -> **Alerta a Telegram**.
+#### Escenario 1: Mantenimiento Anual (Diciembre)
+1.  El Ops Center muestra **ROJO** en "Ingesta INE".
+2.  El operador descarga el CSV manual del INE.
+3.  El operador pulsa **"RUN"** en la tarea 10 (Ingest).
+4.  El semáforo pasa a **VERDE** (365 días restantes).
+5.  El operador pulsa **"RUN"** en la tarea 03 (Compute) para propagar el dato nuevo a todos los mapas.
 
-### B. Ops Control Center (Panel de Admin)
-Interfaz gráfica para gestionar el pipeline sin tocar la consola.
+#### Escenario 2: Nueva Ciudad (ej: Sevilla)
+1.  Añadir `"SEVILLA"` en la lista `ACTIVE_CITIES` de `config.py`.
+2.  Refrescar Ops Center. Aparece "Google POIs (SEVILLA)" en **BLANCO/ROJO**.
+3.  Pulsar **"RUN"** en Tarea 30 (Google) para Sevilla.
+4.  Pulsar **"RUN"** en Tarea 03 y 04 (Compute) para calcular Renta/Target en los hexágonos de Sevilla (el script usará los datos INE ya descargados previamente).
 
-* **Script:** `app/admin_ops.py`
-* **Acceso:** `streamlit run app/admin_ops.py`
-* **Funcionalidades:**
-    * 🚦 Semáforo de estado (Verde/Rojo) por tarea.
-    * ▶️ **Botón de Ejecución Manual:** Lanza los scripts de Python en segundo plano.
-    * 📜 **Logs:** Muestra la salida de la consola y guarda el historial en SQL.
+---
 
-### C. Dashboard de Cliente (Top Picks)
-La cara visible del producto. Visualiza los resultados de la tabla `retail_results`.
+## 5. ESTRUCTURA DE CARPETAS DEL PROYECTO
 
-* **Script:** `app/dashboard_top_picks.py`
-* **Acceso:** `streamlit run app/dashboard_top_picks.py`
-* **Key Features:**
-    * Filtrado por Presupuesto y Distancia al Metro.
-    * Ranking "Oro/Plata/Bronce" visual en mapa 3D (PyDeck).
-    * **IA Insight:** Integración con GPT-4 para explicar *por qué* una ubicación es buena.
+```text
+spatia-li/
+├── config.py             # Configuración Maestra (Ciudades Activas, DB)
+├── utils.py              # Decorador de Logging y Scope
+├── app/
+│   └── pages/
+│       └── admin_ops.py  # El Panel de Control (Streamlit)
+├── data/
+│   └── raw/              # "Data Lake": Aquí viven los CSVs del INE y TIFs
+└── processes/            # Lógica de Negocio (ETL)
+    ├── ingest/           # Scripts de Descarga/Scraping/Verificación (IDs 10, 20, 30)
+    └── compute/          # Scripts de Cálculo Matemático (IDs 03, 04)
