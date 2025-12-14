@@ -22,28 +22,19 @@ OUTPUT_FINAL_PATH = os.path.join(project_root, "data", "processed", "02_final_da
 
 warnings.filterwarnings("ignore")
 
-# ==========================================
-# 🔧 CONFIGURACIÓN OSMNX (ANTI-CUELGUES)
-# ==========================================
-# 1. Muestra logs en consola para saber que está descargando y no "colgado"
-ox.settings.log_console = True 
-# 2. Guarda los datos en disco (carpeta ./cache). La próxima vez será instantáneo.
-ox.settings.use_cache = True
-# 3. Aumenta el tiempo de espera (timeout) a 30 mins para ciudades grandes como Madrid
-ox.settings.timeout = 1800 
-
 # ================= FUNCIONES =================
 
 def get_osrm_dist(origin_lat, origin_lon, dest_gdf):
     """Calcula distancia a pie (en segundos) usando servidor OSRM local."""
-    if dest_gdf.empty: return 5000 
+    if dest_gdf.empty: return 5000 # Penalización si no hay destino
     
-    # 1. Filtro Euclidiano Rápido (aprox 5km)
+    # 1. Filtro Euclidiano Rápido (aprox) para evitar llamadas inútiles a la API
     origin_point = Point(origin_lon, origin_lat)
     dest_gdf_calc = dest_gdf.copy()
     dest_gdf_calc['temp_dist'] = dest_gdf_calc.distance(origin_point)
     nearest = dest_gdf_calc.sort_values('temp_dist').iloc[0]
     
+    # Si el punto más cercano está a >0.05 grados (~5km), devolvemos "lejos" directamente
     if nearest['temp_dist'] > 0.05: return 5000 
 
     # 2. Petición a OSRM
@@ -69,7 +60,7 @@ def get_google_pois_from_db(city_name):
     }
     categories_sql = "', '".join(category_map.keys())
     
-    # Búsqueda parcial (LIKE)
+    # Búsqueda parcial (LIKE) para que coincida "MADRID" con "Madrid, Spain"
     query = f"""
     SELECT latitude, longitude, search_category
     FROM public.retail_poi_master
@@ -90,6 +81,7 @@ def get_google_pois_from_db(city_name):
         pois_dict = {}
         df_db['internal_type'] = df_db['search_category'].map(category_map)
         
+        # Separamos en diccionarios para acceso rápido
         for p_type in df_db['internal_type'].unique():
             pois_dict[p_type] = gdf_google[df_db['internal_type'] == p_type]
             
@@ -103,13 +95,14 @@ def get_transit_osm(bbox):
     try:
         tags = {"highway": "bus_stop", "railway": "subway_entrance"}
         
-        # Corrección: bbox como tupla (N, S, E, W)
+        # CORRECCIÓN AQUÍ: Usamos el argumento 'bbox' como tupla (N, S, E, W)
         gdf = ox.features_from_bbox(
             bbox=(bbox['max_lat'], bbox['min_lat'], bbox['max_lon'], bbox['min_lon']),
             tags=tags
         )
         
         if not gdf.empty:
+            # Usamos el centroide porque las paradas a veces son polígonos
             gdf['geometry'] = gdf.geometry.centroid
             return gdf
             
@@ -144,6 +137,7 @@ for city in cities_to_process:
     # Filtramos hexágonos solo de esta ciudad
     df_city = df_grid[df_grid['city'] == city].copy()
     
+    # Obtenemos BBox del config
     bbox = CITY_BBOXES.get(city)
     
     if not bbox:
@@ -151,8 +145,7 @@ for city in cities_to_process:
         continue
 
     # A. Descargar Transporte (OSM)
-    print(f"   🚌 Descargando Transporte (OSM) para {city}...")
-    print("      (Esto puede tardar unos minutos la primera vez. Mira los logs abajo 👇)")
+    print("   🚌 Descargando Transporte (OSM)...")
     gdf_transit = get_transit_osm(bbox)
 
     # B. Descargar POIs (PostGIS)
@@ -162,7 +155,7 @@ for city in cities_to_process:
     total = len(df_city)
     print(f"   🚀 Calculando OSRM para {total} hexágonos...")
 
-    # Inicializar columnas
+    # Inicializar columnas por defecto
     df_city['dist_cafe'] = 5000
     df_city['dist_gym'] = 5000
     df_city['dist_shop'] = 5000

@@ -63,4 +63,4 @@ def dry_run(city_name):
 if __name__ == "__main__":
     # CAMBIA ESTO POR LA CIUDAD QUE QUIERAS PROBAR
     # dry_run("LASTABLAS_TEST")
-    dry_run("VALENCIA")
+    dry_run("BARCELONA")

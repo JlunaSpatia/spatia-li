@@ -23,7 +23,7 @@ except ImportError:
     DB_CONNECTION_STR = "postgresql://postgres:postgres@localhost:5432/spatia"
 
 # RUTA CORRECTA AL DATASET PROCESADO
-CSV_PATH = os.path.join(project_root, "data", "processed", "final_dataset.csv")
+CSV_PATH = os.path.join(project_root, "data", "processed", "01_urban_grid.csv")
 
 # ==========================================
 # 2. PROCESO DE CARGA
