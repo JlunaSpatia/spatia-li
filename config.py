@@ -49,6 +49,18 @@ CITY_BBOXES = {
         "max_lat": 41.7800,
         "min_lon": -2.4900, 
         "max_lon": -2.4500
+    },
+    "EL_PORTIL": {
+        "min_lat": 37.2125,  # Sur
+        "max_lat": 37.2185,  # Norte
+        "min_lon": -7.0460,  # Oeste
+        "max_lon": -7.0380   # Este
+    },
+    "ALCALA": {
+        "min_lat": 40.4580,  # Sur (Barrio Venecia / Nueva Alcalá)
+        "max_lat": 40.5300,  # Norte (El Ensanche / Espartales)
+        "min_lon": -3.4300,  # Oeste (La Garena)
+        "max_lon": -3.3200   # Este (Universidad / Hospital)
     }
 }
 
@@ -57,7 +69,7 @@ CITY_BBOXES = {
 # ==========================================
 # Si está VACÍO [], los scripts procesarán TODAS las ciudades del diccionario.
 # Si tiene nombres ["BARCELONA"], SOLO se procesará esa ciudad.
-ACTIVE_CITIES = ["SORIA_TEST"] 
+ACTIVE_CITIES = ["MADRID"] 
 
 # ==========================================
 # 5. PESOS DE NEGOCIO (SCORING)
