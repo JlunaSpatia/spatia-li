@@ -8,6 +8,7 @@ from rasterstats import zonal_stats
 import warnings
 import sys
 import os
+import math
 
 # ==========================================
 # 1. SETUP Y CONFIGURACIÓN
@@ -22,7 +23,7 @@ try:
         DATA_DIR, 
         CITY_BBOXES, 
         H3_RESOLUTION, 
-        OSRM_WALK_URL,  # Debe ser http://localhost:5001
+        OSRM_WALK_URL, 
         ACTIVE_CITIES
     )
 except ImportError:
@@ -36,50 +37,37 @@ GHS_FILENAME = "GHS_BUILT_S_E1975_GLOBE_R2023A_4326_3ss_V1_0.tif"
 GHS_PATH = os.path.join(project_root, DATA_DIR, GHS_FILENAME)
 
 print(f"🔧 Configuración cargada.")
-print(f"📡 OSRM URL: {OSRM_WALK_URL}")
-print(f"🛢️ Transporte: Usando PostGIS Local (Tabla: osm_transport_points)")
+print(f"📡 OSRM URL: {OSRM_WALK_URL} (Prioridad Máxima)")
+print(f"🛢️ Transporte: Usando PostGIS Local")
 
 # ==========================================
-# 2. FUNCIONES
+# 2. FUNCIONES DE CARGA
 # ==========================================
 
 def get_transport_from_db(bbox_dict):
-    """
-    Consulta la tabla osm_transport_points usando PostGIS.
-    Es instantáneo, no requiere internet y gasta 0 RAM en Python.
-    """
     min_lon, min_lat = bbox_dict['min_lon'], bbox_dict['min_lat']
     max_lon, max_lat = bbox_dict['max_lon'], bbox_dict['max_lat']
     
-    # Query SQL con filtro espacial (ST_MakeEnvelope)
-    # Le pedimos a la base de datos solo los puntos dentro de la caja de la ciudad.
-    # El operador && usa el índice espacial que creamos, por lo que tarda milisegundos.
     query = f"""
     SELECT * FROM osm_transport_points
     WHERE geometry && ST_MakeEnvelope({min_lon}, {min_lat}, {max_lon}, {max_lat}, 4326)
     """
-    
     engine = create_engine(DB_CONNECTION_STR)
     try:
-        # read_postgis devuelve un GeoDataFrame directamente
         gdf = gpd.read_postgis(query, engine, geom_col='geometry')
         return gdf
     except Exception as e:
-        print(f"      ⚠️ Error consultando PostGIS: {e}")
         return gpd.GeoDataFrame()
 
 def filter_by_urban_footprint(df_hex):
-    if not os.path.exists(GHS_PATH):
-        return df_hex
+    if not os.path.exists(GHS_PATH): return df_hex
     
     hex_polygons = []
     for h in df_hex['h3_index']:
         geo_json = h3.h3_to_geo_boundary(h, geo_json=True)
-        poly = Polygon(geo_json) 
-        hex_polygons.append(poly)
+        hex_polygons.append(Polygon(geo_json))
     
     gdf_temp = gpd.GeoDataFrame({'h3_index': df_hex['h3_index']}, geometry=hex_polygons, crs="EPSG:4326")
-    
     stats = zonal_stats(vectors=gdf_temp['geometry'], raster=GHS_PATH, stats=['sum'])
     df_hex['built_up_score'] = [x['sum'] if x['sum'] is not None else 0 for x in stats]
     
@@ -97,33 +85,8 @@ def get_hexagons_from_bbox(city_name, bbox_dict):
     df_hex['lon'] = df_hex['h3_index'].apply(lambda x: h3.h3_to_geo(x)[1])
     return df_hex
 
-def get_osrm_dist(origin_lat, origin_lon, dest_gdf):
-    if dest_gdf.empty: return 5000
-    
-    origin_point = Point(origin_lon, origin_lat)
-    
-    # 1. Pre-filtro matemático (Rápido)
-    dest_gdf_calc = dest_gdf.copy()
-    dest_gdf_calc['temp_dist'] = dest_gdf_calc.distance(origin_point)
-    nearest = dest_gdf_calc.sort_values('temp_dist').iloc[0]
-    
-    # Si está a más de ~5km (0.05 grados), ni preguntamos
-    if nearest['temp_dist'] > 0.05: return 5000 
-
-    # 2. Consulta a OSRM Local
-    url = f"{OSRM_WALK_URL}/route/v1/foot/{origin_lon},{origin_lat};{nearest.geometry.x},{nearest.geometry.y}?overview=false"
-    
-    try:
-        r = requests.get(url, timeout=0.1) 
-        if r.status_code == 200:
-            res = r.json()
-            if 'routes' in res and len(res['routes']) > 0:
-                return res['routes'][0]['duration']
-    except: pass
-    return 5000
-
 def get_google_pois_from_db(city_name):
-    print(f"      🛢️ Consultando PostGIS (POIs Comerciales) para {city_name}...")
+    print(f"      🛢️ Consultando PostGIS (POIs Comerciales)...")
     category_map = {
         'Cafetería': 'cafe', 'Bar': 'cafe', 'Panadería': 'cafe', 'Restaurante': 'cafe',
         'Gimnasio': 'gym', 'Tienda de ropa': 'shop', 'Centro comercial': 'shop', 'Tienda de deportes': 'shop'
@@ -152,10 +115,59 @@ def get_google_pois_from_db(city_name):
     except: return {}
 
 # ==========================================
-# 3. PROCESO PRINCIPAL
+# 3. LÓGICA DE CÁLCULO INTELIGENTE (PRIORIDAD OSRM)
 # ==========================================
 
-print(f"🚀 GENERANDO DATASET (Modo 100% Local y Optimizado)...")
+def calculate_distance_smart(row, dest_gdf):
+    """
+    1. Intenta OSRM SIEMPRE.
+    2. Si falla OSRM, usa Euclidian.
+    """
+    # 0. ¿VACÍO?
+    if dest_gdf is None or dest_gdf.empty: 
+        return 5000, 'MAX'
+
+    origin_lat, origin_lon = row['lat'], row['lon']
+    origin_point = Point(origin_lon, origin_lat)
+    
+    # Buscamos el POI más cercano (necesario para saber a dónde rutear)
+    series_dist = dest_gdf.distance(origin_point)
+    nearest_idx = series_dist.idxmin()
+    nearest_dist_deg = series_dist.loc[nearest_idx]
+    nearest_poi = dest_gdf.loc[nearest_idx]
+
+    # 1. FILTRO DE LEJANÍA OBVIA (> 5km)
+    if nearest_dist_deg > 0.05: 
+        return 5000, 'MAX'
+
+    # 2. INTENTO OSRM (PRIORIDAD TOTAL)
+    # No importa si está dentro o fuera, lo intentamos.
+    url = f"{OSRM_WALK_URL}/route/v1/foot/{origin_lon},{origin_lat};{nearest_poi.geometry.x},{nearest_poi.geometry.y}?overview=false"
+    try:
+        r = requests.get(url, timeout=0.15) 
+        if r.status_code == 200:
+            res = r.json()
+            if 'routes' in res and len(res['routes']) > 0:
+                duration = res['routes'][0]['duration']
+                return duration, 'OSRM'
+    except:
+        pass # Fallo técnico o de snapping -> Pasamos a Plan B
+
+    # 3. RESCATE EUCLIDIANO (Solo si OSRM falla)
+    dy_meters = (nearest_poi.geometry.y - origin_lat) * 111132
+    dx_meters = (nearest_poi.geometry.x - origin_lon) * 85000
+    dist_meters = math.sqrt(dx_meters**2 + dy_meters**2)
+    
+    # Penalización x1.35
+    walking_seconds = (dist_meters * 1.35) / 1.25
+    
+    return walking_seconds, 'EUCLID'
+
+# ==========================================
+# 4. PROCESO PRINCIPAL
+# ==========================================
+
+print(f"🚀 GENERANDO DATASET (PRIORIDAD OSRM + FALLBACK)...")
 os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
 
 if ACTIVE_CITIES:
@@ -176,31 +188,41 @@ for city_name in cities_to_process:
     df_hex = filter_by_urban_footprint(df_hex)
     if df_hex.empty: continue
 
-    # C. Transporte (AHORA DESDE DB LOCAL)
-    print("      🚌 Consultando transporte en DB...")
-    # Llamamos a la nueva función que no usa internet ni PBFs gigantes
+    # C. Transporte
+    print("      🚌 Consultando transporte...")
     gdf_transit = get_transport_from_db(bbox)
     
-    if not gdf_transit.empty:
-        print(f"      ✅ {len(gdf_transit)} paradas encontradas (PostGIS).")
-    else:
-        print("      ⚠️ No se encontraron paradas en esta zona (¿Carga correcta?).")
-
-    # D. POIs & Distancias
+    # D. POIs
     google_pois = get_google_pois_from_db(city_name)
-    total = len(df_hex)
-    print(f"      🚀 Calculando tiempos a pie para {total} hexágonos...")
     
-    for c in ['dist_cafe', 'dist_gym', 'dist_shop', 'dist_transit']: df_hex[c] = 5000
+    # E. Inicialización de columnas
+    metrics = ['cafe', 'gym', 'shop', 'transit']
+    for m in metrics:
+        df_hex[f'dist_{m}'] = 5000.0
+        df_hex[f'source_{m}'] = 'INIT' 
 
+    total = len(df_hex)
+    print(f"      🚀 Calculando tiempos (OSRM mandatorio)...")
+
+    # F. Bucle de Cálculo
     for idx, row in df_hex.iterrows():
         if idx % 500 == 0: print(f"         {idx}/{total}...", end="\r")
         
-        if 'cafe' in google_pois: df_hex.at[idx, 'dist_cafe'] = get_osrm_dist(row['lat'], row['lon'], google_pois['cafe'])
-        if 'gym' in google_pois: df_hex.at[idx, 'dist_gym'] = get_osrm_dist(row['lat'], row['lon'], google_pois['gym'])
-        if 'shop' in google_pois: df_hex.at[idx, 'dist_shop'] = get_osrm_dist(row['lat'], row['lon'], google_pois['shop'])
-        if not gdf_transit.empty: df_hex.at[idx, 'dist_transit'] = get_osrm_dist(row['lat'], row['lon'], gdf_transit)
+        # Iteramos por métrica
+        for metric, gdf_source in [
+            ('cafe', google_pois.get('cafe')),
+            ('gym', google_pois.get('gym')),
+            ('shop', google_pois.get('shop')),
+            ('transit', gdf_transit)
+        ]:
+            if gdf_source is not None and not gdf_source.empty:
+                # Ya no pasamos mapas de presencia, solo la fila y el destino
+                val, src = calculate_distance_smart(row, gdf_source)
+                
+                df_hex.at[idx, f'dist_{metric}'] = val
+                df_hex.at[idx, f'source_{metric}'] = src
 
+    # G. Guardado
     if os.path.exists(CSV_PATH):
         df_old = pd.read_csv(CSV_PATH)
         df_final = pd.concat([df_old[df_old['city'] != city_name], df_hex], ignore_index=True)

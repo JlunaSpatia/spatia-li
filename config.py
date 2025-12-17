@@ -69,7 +69,7 @@ CITY_BBOXES = {
 # ==========================================
 # Si está VACÍO [], los scripts procesarán TODAS las ciudades del diccionario.
 # Si tiene nombres ["BARCELONA"], SOLO se procesará esa ciudad.
-ACTIVE_CITIES = ["MADRID"] 
+ACTIVE_CITIES = ["BARCELONA"] 
 
 # ==========================================
 # 5. PESOS DE NEGOCIO (SCORING)
