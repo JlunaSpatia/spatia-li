@@ -22,6 +22,8 @@ except ImportError:
 SHP_FILENAME = "SECC_CE_20230101.shp"
 CSV_FILENAME = "INE_2023_Renta.csv"
 TARGET_INDICATOR = "Renta bruta media por hogar" 
+# Usamos el CRS del script original para cálculos de área precisos
+CALC_CRS = "EPSG:25830" 
 
 CENSUS_SHP = os.path.join(BASE_DIR, "data", "raw", SHP_FILENAME)
 RENTA_CSV = os.path.join(BASE_DIR, "data", "raw", CSV_FILENAME)
@@ -49,64 +51,54 @@ def ensure_table_structure(engine):
                 year INTEGER
             );
         """))
-        try:
-            conn.execute(text(f"ALTER TABLE {SCHEMA}.{TABLE} ADD COLUMN IF NOT EXISTS city TEXT;"))
-            conn.execute(text(f"ALTER TABLE {SCHEMA}.{TABLE} ADD COLUMN IF NOT EXISTS year INTEGER;"))
-            conn.commit()
-        except: pass
+        conn.commit()
 
 def get_shapefile_crs(path):
     try:
-        mini_gdf = gpd.read_file(path, rows=1)
-        return mini_gdf.crs
-    except Exception as e:
-        print(f"❌ Error detectando CRS: {e}")
-        return None
+        mini = gpd.read_file(path, rows=1)
+        return mini.crs
+    except: return None
 
 def load_census_layer():
     engine = create_engine(DB_URL)
     census_year = extract_year_from_filename(CSV_FILENAME)
-    
-    print(f"🚀 INICIANDO CENSUS FINAL (Fix Tuple) - Año: {census_year}")
+    print(f"🚀 INICIANDO CENSUS (Lógica de Pesos Corregida) - Año: {census_year}")
     
     ensure_table_structure(engine)
 
-    # 1. LEER CSV
+    # 1. LEER CSV (Lógica robusta del script original)
     print("📥 [1/4] Leyendo CSV INE...")
     try:
-        preview = pd.read_csv(RENTA_CSV, sep=';', dtype=str, encoding='utf-8', nrows=5)
-        col_ind = next((c for c in preview.columns if 'Indicadores' in c), None)
-        if not col_ind: return
-
-        cols_to_use = ['Secciones', 'Periodo', 'Total', col_ind]
-        df_csv = pd.read_csv(RENTA_CSV, sep=';', dtype=str, encoding='utf-8', usecols=lambda c: c in cols_to_use)
+        df = pd.read_csv(RENTA_CSV, sep=';', dtype=str, encoding='utf-8')
+        df.columns = df.columns.str.strip()
         
-        df_csv = df_csv[df_csv[col_ind].str.contains(TARGET_INDICATOR, case=False, na=False)]
+        # Filtro Indicador y Año
+        col_ind = [c for c in df.columns if 'Indicadores' in c][0]
+        mask_ind = df[col_ind].str.contains(TARGET_INDICATOR, case=False, na=False)
         
-        if 'Periodo' in df_csv.columns:
-            data_year = pd.to_numeric(df_csv['Periodo'], errors='coerce').max()
-            df_csv = df_csv[pd.to_numeric(df_csv['Periodo'], errors='coerce') == data_year]
-
-        df_csv = df_csv.dropna(subset=['Secciones'])
+        periodos = pd.to_numeric(df['Periodo'], errors='coerce')
+        target_year = periodos.max()
+        mask_per = periodos == target_year
         
-        # ID CLEANING
-        df_csv['CUSEC'] = df_csv['Secciones'].astype(str).str.strip().str[:10]
-        df_csv['renta_hogar'] = df_csv['Total'].apply(clean_currency_ine)
+        df_clean = df[mask_ind & mask_per].copy()
         
-        df_renta_clean = df_csv[['CUSEC', 'renta_hogar']].copy()
-        del df_csv
+        df_clean['renta'] = df_clean['Total'].apply(clean_currency_ine)
+        df_clean['CUSEC'] = df_clean['Secciones'].astype(str).str.strip().str[:10]
+        
+        # Solo rentas válidas
+        df_renta = df_clean[df_clean['renta'] > 0][['CUSEC', 'renta']].copy()
+        
+        del df, df_clean
         gc.collect()
-        
-        print(f"   📊 Datos cargados: {len(df_renta_clean)} registros.")
+        print(f"   📊 Datos CSV listos: {len(df_renta)} secciones.")
 
     except Exception as e:
         print(f"❌ Error CSV: {e}")
         return
 
-    # 2. DETECTAR CRS MAPA
+    # 2. CRS MAPA
     map_crs = get_shapefile_crs(CENSUS_SHP)
     if not map_crs: return
-    print(f"   🗺️ CRS Mapa: {map_crs}")
 
     # 3. CIUDADES
     target_cities = ACTIVE_CITIES
@@ -126,63 +118,54 @@ def load_census_layer():
 
         # A. Obtener Grid
         try:
-            sql_grid = text("SELECT h3_id, geometry FROM core.hexagons WHERE city = :city")
-            gdf_hex_city = gpd.read_postgis(sql_grid, engine, params={"city": city}, geom_col="geometry")
-            if gdf_hex_city.empty:
-                print("      ⚠️ Sin hexágonos. Saltando.")
-                continue
+            sql = text("SELECT h3_id, geometry FROM core.hexagons WHERE city = :city")
+            gdf_hex = gpd.read_postgis(sql, engine, params={"city": city}, geom_col="geometry")
+            if gdf_hex.empty: continue
 
-            # B. Transformar Caja (BBOX)
-            minx, miny, maxx, maxy = gdf_hex_city.total_bounds
-            bbox_polygon_4326 = box(minx, miny, maxx, maxy)
-            
-            bbox_series = gpd.GeoSeries([bbox_polygon_4326], crs="EPSG:4326")
-            bbox_series_transformed = bbox_series.to_crs(map_crs)
-            bbox_transformed = bbox_series_transformed.total_bounds # Esto devuelve un numpy array
-            
+            # Caja para recorte
+            bounds_4326 = gdf_hex.total_bounds
+            bbox_poly = box(*bounds_4326)
+            bbox_trans = gpd.GeoSeries([bbox_poly], crs="EPSG:4326").to_crs(map_crs).total_bounds
         except Exception as e:
             print(f"      ❌ Error grid: {e}")
             continue
 
-        # C. Leer Mapa (FIX APLICADO AQUÍ: tuple())
-        print("      🗺️ Leyendo mapa...")
+        # B. Leer Mapa Local
         try:
-            # ⬇️⬇️⬇️ AQUÍ ESTÁ EL ARREGLO: tuple(...) ⬇️⬇️⬇️
-            gdf_mapa_local = gpd.read_file(CENSUS_SHP, bbox=tuple(bbox_transformed))
-            
-            if gdf_mapa_local.empty:
-                print(f"      ⚠️ Mapa vacío para esta zona.")
-                continue
+            gdf_mapa = gpd.read_file(CENSUS_SHP, bbox=tuple(bbox_trans)).to_crs("EPSG:4326")
+            if gdf_mapa.empty: continue
 
-            gdf_mapa_local = gdf_mapa_local.to_crs("EPSG:4326")
-            col_mapa = next((c for c in gdf_mapa_local.columns if c in ['CUSEC', 'CD_SECC']), None)
-            if col_mapa:
-                gdf_mapa_local.rename(columns={col_mapa: 'CUSEC'}, inplace=True)
-                gdf_mapa_local['CUSEC'] = gdf_mapa_local['CUSEC'].astype(str).str.strip()
-            else:
-                print("      ❌ Sin columna CUSEC.")
-                continue
-
+            col_mapa = next((c for c in gdf_mapa.columns if c in ['CUSEC', 'CD_SECC']), None)
+            gdf_mapa.rename(columns={col_mapa: 'CUSEC'}, inplace=True)
+            gdf_mapa['CUSEC'] = gdf_mapa['CUSEC'].astype(str).str.strip()
         except Exception as e:
-            print(f"      ❌ Error leyendo Shapefile: {e}")
+            print(f"      ❌ Error mapa: {e}")
             continue
 
-        # D. Cruce
-        gdf_census_local = gdf_mapa_local.merge(df_renta_clean, on='CUSEC', how='inner')
-        if gdf_census_local.empty:
-            print("      ⚠️ Cruce vacío (IDs no coinciden).")
-            continue
+        # C. Cruce
+        gdf_merged = gdf_mapa.merge(df_renta, on='CUSEC', how='inner')
+        if gdf_merged.empty: continue
 
-        # E. Interpolación
-        gdf_census_local = gdf_census_local.to_crs("EPSG:3857")
-        gdf_hex_proj = gdf_hex_city.to_crs("EPSG:3857")
-        gdf_census_local['area_orig'] = gdf_census_local.area
-        
+        # D. INTERPOLACIÓN (CORRECCIÓN DE LÓGICA)
+        # ---------------------------------------------------------------------
         try:
-            overlay = gpd.overlay(gdf_census_local, gdf_hex_proj, how='intersection')
-            overlay['weight'] = overlay.area / overlay['area_orig']
-            overlay['w_renta'] = overlay['renta_hogar'] * overlay['weight']
+            # Proyectamos ambos al sistema de cálculo (Metros)
+            gdf_merged = gdf_merged.to_crs(CALC_CRS)
+            gdf_hex_proj = gdf_hex.to_crs(CALC_CRS)
             
+            # 1. Calculamos el área total del hexágono (denominador correcto para variables intensivas)
+            gdf_hex_proj['area_hex'] = gdf_hex_proj.geometry.area
+            
+            # 2. Intersección
+            overlay = gpd.overlay(gdf_merged, gdf_hex_proj, how='intersection')
+            
+            # 3. PESO = área_intersección / área_del_hexágono
+            overlay['weight'] = overlay.geometry.area / overlay['area_hex']
+            
+            # 4. Valor ponderado
+            overlay['w_renta'] = overlay['renta'] * overlay['weight']
+            
+            # 5. Agrupar
             result = overlay.groupby('h3_id')['w_renta'].sum().reset_index()
             result.rename(columns={'w_renta': 'renta_media_hogar'}, inplace=True)
             
@@ -190,19 +173,15 @@ def load_census_layer():
             result['year'] = census_year
             
             result.to_sql(TABLE, engine, schema=SCHEMA, if_exists='append', index=False)
-            print(f"      ✅ Guardados {len(result)} registros.")
-            
+            print(f"      ✅ Guardados {len(result)} registros. Max Renta: {result['renta_media_hogar'].max():.0f}€")
+
         except Exception as e:
             print(f"      ❌ Error cálculo: {e}")
 
-        del gdf_mapa_local, gdf_hex_city, gdf_census_local, result
+        del gdf_mapa, gdf_hex, gdf_merged, result
         gc.collect()
 
-    print("\n🏁 Finalizando índices...")
-    with engine.connect() as conn:
-        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_census_h3 ON {SCHEMA}.{TABLE} (h3_id);"))
-        conn.commit()
-    print("✅ PROCESO COMPLETADO.")
+    print("\n✅ PROCESO COMPLETADO.")
 
 if __name__ == "__main__":
     load_census_layer()
