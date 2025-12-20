@@ -44,12 +44,6 @@ CITY_BBOXES = {
         "min_lon": -3.6800, "max_lon": -3.6550 
     },
 
-    "SORIA_TEST": {
-        "min_lat": 41.7500, 
-        "max_lat": 41.7800,
-        "min_lon": -2.4900, 
-        "max_lon": -2.4500
-    },
     "EL_PORTIL": {
         "min_lat": 37.2125,  # Sur
         "max_lat": 37.2185,  # Norte
@@ -68,8 +62,8 @@ CITY_BBOXES = {
 # 4. PANEL DE CONTROL (FILTRO DE EJECUCIÓN)
 # ==========================================
 # Si está VACÍO [], los scripts procesarán TODAS las ciudades del diccionario.
-# Si tiene nombres ["BARCELONA"], SOLO se procesará esa ciudad.
-ACTIVE_CITIES = ["BARCELONA"] 
+# Si tiene nombres ["MADRID"], SOLO se procesará esa ciudad.
+ACTIVE_CITIES = ["ALCALA"] 
 
 # ==========================================
 # 5. PESOS DE NEGOCIO (SCORING)
