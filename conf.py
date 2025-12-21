@@ -45,10 +45,10 @@ CITY_BBOXES = {
     },
 
     "EL_PORTIL": {
-        "min_lat": 37.2125,  # Sur
-        "max_lat": 37.2185,  # Norte
-        "min_lon": -7.0460,  # Oeste
-        "max_lon": -7.0380   # Este
+        "min_lat": 37.1950,  # Sur (Línea de costa/Playa)
+        "max_lat": 37.2350,  # Norte (Incluye Laguna y zona norte del Golf)
+        "min_lon": -7.0950,  # Oeste (Límite de Nuevo Portil hacia San Miguel)
+        "max_lon": -7.0300   # Este (Límite hacia la zona de pinos de Punta Umbría)
     },
     "ALCALA": {
         "min_lat": 40.4580,  # Sur (Barrio Venecia / Nueva Alcalá)
@@ -63,7 +63,7 @@ CITY_BBOXES = {
 # ==========================================
 # Si está VACÍO [], los scripts procesarán TODAS las ciudades del diccionario.
 # Si tiene nombres ["MADRID"], SOLO se procesará esa ciudad.
-ACTIVE_CITIES = ["BARCELONA"] 
+ACTIVE_CITIES = ["EL_PORTIL"] 
 
 # ==========================================
 # 5. PESOS DE NEGOCIO (SCORING)
