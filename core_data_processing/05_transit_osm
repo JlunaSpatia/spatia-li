@@ -1,0 +1,152 @@
+import sys
+import os
+import requests
+import h3
+import geopandas as gpd
+import pandas as pd
+from sqlalchemy import create_engine, text
+from shapely.geometry import Point
+import gc
+
+# 1. Configuración de rutas
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+
+try:
+    from conf import DB_URL, ACTIVE_CITIES, CITY_BBOXES, H3_RESOLUTION
+except ImportError:
+    print("❌ Error: No se encuentra 'conf.py' o faltan variables críticas.")
+    sys.exit(1)
+
+# --- CONFIGURACIÓN ---
+SCHEMA = "core"
+TABLE = "transit_osm_points"
+
+def ensure_table_structure(engine):
+    """Crea la tabla y asegura que tenga la columna h3_id incluso si ya existía."""
+    with engine.connect() as conn:
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA};"))
+        
+        # A. Crear la tabla si no existe
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {SCHEMA}.{TABLE} (
+                osm_id BIGINT PRIMARY KEY,
+                h3_id TEXT,
+                name TEXT,
+                transit_type TEXT,
+                city TEXT,
+                geometry GEOMETRY(Point, 4326)
+            );
+        """))
+        
+        # B. Forzar la columna h3_id si la tabla se creó en versiones anteriores
+        conn.execute(text(f"ALTER TABLE {SCHEMA}.{TABLE} ADD COLUMN IF NOT EXISTS h3_id TEXT;"))
+        
+        # C. Crear índice para optimizar los JOINS de Analytics
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{TABLE}_h3 ON {SCHEMA}.{TABLE} (h3_id);"))
+        conn.commit()
+
+def download_osm_transit(bbox):
+    """Descarga paradas de transporte con reintentos en múltiples servidores."""
+    MIRRORS = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.nchc.org.tw/api/interpreter"
+    ]
+    
+    # Query optimizada para Barcelona y grandes núcleos
+    overpass_query = f"""
+    [out:json][timeout:180][maxsize:1073741824];
+    (
+      node["highway"="bus_stop"]({bbox['min_lat']},{bbox['min_lon']},{bbox['max_lat']},{bbox['max_lon']});
+      node["amenity"="bus_station"]({bbox['min_lat']},{bbox['min_lon']},{bbox['max_lat']},{bbox['max_lon']});
+      node["railway"~"station|halt|tram_stop"]({bbox['min_lat']},{bbox['min_lon']},{bbox['max_lat']},{bbox['max_lon']});
+      node["public_transport"="stop_position"]({bbox['min_lat']},{bbox['min_lon']},{bbox['max_lat']},{bbox['max_lon']});
+    );
+    out body;
+    """
+    
+    for url in MIRRORS:
+        try:
+            print(f"   📡 Intentando conexión con mirror: {url}...")
+            response = requests.post(url, data={'data': overpass_query}, timeout=190)
+            
+            if response.status_code == 200:
+                data = response.json()
+                elements = []
+                for el in data.get('elements', []):
+                    tags = el.get('tags', {})
+                    t_type = "bus"
+                    if "railway" in tags: t_type = "train/metro"
+                    elif "tram" in tags: t_type = "tram"
+                    
+                    elements.append({
+                        'osm_id': el['id'],
+                        'name': tags.get('name', 'Unnamed stop'),
+                        'transit_type': t_type,
+                        'lon': el['lon'],
+                        'lat': el['lat']
+                    })
+                return pd.DataFrame(elements)
+            else:
+                print(f"   ⚠️ Servidor ocupado (Código {response.status_code}). Saltando...")
+        except Exception as e:
+            print(f"   ❌ Fallo en este mirror: {e}")
+            continue
+            
+    return pd.DataFrame()
+
+def main():
+    engine = create_engine(DB_URL)
+    ensure_table_structure(engine)
+    print(f"📡 INICIANDO EXTRACCIÓN TRANSIT R2025 (Indexación H3)")
+
+    for city in ACTIVE_CITIES:
+        print(f"\n🏙️  Procesando: {city}")
+        
+        if city not in CITY_BBOXES:
+            print(f"   ⚠️ BBOX no encontrado en conf.py para {city}")
+            continue
+            
+        # 1. Descarga con control de errores
+        df = download_osm_transit(CITY_BBOXES[city])
+        
+        if df.empty:
+            print(f"   ❌ No se pudieron obtener datos para {city}. Revisa la conexión o el BBOX.")
+            continue
+
+        # 2. Indexación H3 (El "oro" para el JOIN de Analytics)
+        print(f"   ⬡ Calculando H3 ID para {len(df)} puntos (Res: {H3_RESOLUTION})...")
+        df['h3_id'] = df.apply(lambda row: h3.geo_to_h3(row['lat'], row['lon'], H3_RESOLUTION), axis=1)
+
+        # 3. GeoDataFrame y Carga
+        geometry = [Point(xy) for xy in zip(df.lon, df.lat)]
+        gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+        gdf['city'] = city
+        
+        temp_name = f"temp_osm_{city.lower()}"
+        gdf[['osm_id', 'h3_id', 'name', 'transit_type', 'city', 'geometry']].to_postgis(
+            temp_name, engine, schema=SCHEMA, if_exists='replace', index=False
+        )
+
+        with engine.connect() as conn:
+            conn.execute(text(f"""
+                INSERT INTO {SCHEMA}.{TABLE} (osm_id, h3_id, name, transit_type, city, geometry)
+                SELECT osm_id, h3_id, name, transit_type, city, geometry FROM {SCHEMA}.{temp_name}
+                ON CONFLICT (osm_id) DO UPDATE SET 
+                    h3_id = EXCLUDED.h3_id,
+                    name = EXCLUDED.name,
+                    transit_type = EXCLUDED.transit_type;
+            """))
+            conn.execute(text(f"DROP TABLE {SCHEMA}.{temp_name};"))
+            conn.commit()
+
+        print(f"   ✅ {city} completado: {len(gdf)} paradas indexadas.")
+        del df, gdf
+        gc.collect()
+
+    print("\n🏁 EXTRACCIÓN Y PRE-INDEXACIÓN COMPLETADA.")
+
+if __name__ == "__main__":
+    main()
