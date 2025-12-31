@@ -9,30 +9,28 @@ class IsochroneService:
         self.engine = create_engine(db_url)
         self.osrm_url = osrm_url
 
-    def calculate_and_save(self, points_list, minutes=15, table_name="catchment_areas", schema="core"):
+    def calculate_and_save(self, points_list, minutes, table_name=None, schema="analytics", id_column="origin_id"):
         """
-        points_list: [{'id': 'h3_index', 'lat': 0.0, 'lon': 0.0}, ...]
+        points_list: [{'id': 'X', 'lat': 0.0, 'lon': 0.0}]
+        id_column: 'origin_id' para clientes, 'h3_id' para ciudades.
         """
+        # Generar nombre de tabla si no se da uno (ej: catchment_10m)
+        target_table = table_name if table_name else f"catchment_{minutes}m"
+        
         results = []
         seconds = minutes * 60
         
         for p in points_list:
+            # Radio adaptativo según los minutos (aprox 100m por minuto)
+            radius = 0.0009 * minutes 
             angles = np.linspace(0, 2 * np.pi, 24)
-            radius = 0.015 
+            destinations = [f"{p['lon'] + (radius * np.sin(a))},{p['lat'] + (radius * np.cos(a))}" for a in angles]
             
-            destinations = []
-            for a in angles:
-                d_lat = p['lat'] + (radius * np.cos(a))
-                d_lon = p['lon'] + (radius * np.sin(a))
-                destinations.append(f"{d_lon},{d_lat}")
-
-            dest_str = ";".join(destinations)
-            url = f"{self.osrm_url}/table/v1/foot/{p['lon']},{p['lat']};{dest_str}?sources=0"
+            url = f"{self.osrm_url}/table/v1/foot/{p['lon']},{p['lat']};{';'.join(destinations)}?sources=0"
             
             try:
                 r = requests.get(url, timeout=5).json()
                 durations = r['durations'][0][1:]
-                
                 poly_points = []
                 for i, d in enumerate(durations):
                     t_lon, t_lat = map(float, destinations[i].split(','))
@@ -43,18 +41,15 @@ class IsochroneService:
                     ))
                 
                 results.append({
-                    'h3_id': p['id'], # Cambiado de origin_id a h3_id
-                    'geometry': Polygon(poly_points),
-                    'city': 'MADRID' # Añadimos la ciudad para facilitar filtros posteriores
+                    id_column: p['id'],
+                    'minutes': minutes,
+                    'geometry': Polygon(poly_points)
                 })
-            
             except Exception as e:
                 print(f"⚠️ Error en punto {p['id']}: {e}")
-                continue
 
         if results:
             gdf = gpd.GeoDataFrame(results, crs="EPSG:4326")
-            # Usamos el parámetro schema dinámico
-            gdf.to_postgis(table_name, self.engine, schema=schema, if_exists='append', index=False)
+            gdf.to_postgis(target_table, self.engine, schema=schema, if_exists='append', index=False)
             return len(results)
         return 0
