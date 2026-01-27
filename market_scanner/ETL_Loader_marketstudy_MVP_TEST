@@ -1,0 +1,173 @@
+import json
+import os
+import sys
+import pandas as pd
+from sqlalchemy import create_engine, text
+from datetime import datetime
+
+# ================= SETUP ROBUSTO =================
+# 1. Rutas del sistema para encontrar 'conf.py'
+script_path = os.path.abspath(__file__)
+market_scanner_dir = os.path.dirname(script_path)
+project_root = os.path.dirname(market_scanner_dir)
+
+if market_scanner_dir not in sys.path:
+    sys.path.insert(0, market_scanner_dir)
+
+# 2. Importamos la configuración REAL (la que conecta con Docker)
+try:
+    from conf import DB_CONNECTION_STR
+    print(f"✅ Configuración cargada. DB: {DB_CONNECTION_STR.split('@')[1]}") # Print seguro sin pass
+except ImportError:
+    print("❌ Error: No se encuentra 'conf.py'.")
+    sys.exit(1)
+
+# ================= CONFIGURACIÓN DE LA CARGA =================
+# Pon aquí el MISMO nombre que usaste en el scraper
+STUDY_NAME = "GYM_BOUTIQUE_MADRID_001" 
+
+TABLES = {
+    'master': 'analytics.retail_poi_master', # <--- Lo metemos en esquema analytics
+    'categories': 'analytics.poi_categories',
+    'metadata': 'analytics.poi_metadata'
+}
+
+# ================= FUNCIONES DE LIMPIEZA =================
+
+def clean_text_field(value):
+    """Limpia texto, evita listas y nulos."""
+    if value is None or value == "": return None
+    if isinstance(value, list): return str(value[0]) if len(value) > 0 else None
+    return str(value)
+
+def safe_float(value):
+    """Convierte a float seguro."""
+    try:
+        if value is None or value == "": return None
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+# ================= PROCESO PRINCIPAL =================
+
+def process_and_load():
+    run_datetime = datetime.now()
+    snapshot_date_iso = run_datetime.strftime("%Y-%m-%d")
+    
+    # 1. Localizar el archivo JSON
+    # Ruta: project_root/data/raw/studies/NOMBRE_RAW.json
+    raw_file = os.path.join(project_root, "data", "raw", "studies", f"{STUDY_NAME}_RAW_V3.json")
+    
+    print(f"🚀 INICIANDO ETL para {STUDY_NAME}")
+    print(f"   📂 Buscando archivo: {raw_file}")
+
+    if not os.path.exists(raw_file):
+        print(f"❌ Error: El archivo no existe. Ejecuta primero el market_scanner.")
+        return
+
+    # 2. Cargar JSON en memoria
+    with open(raw_file, 'r', encoding='utf-8') as f:
+        raw_data = json.load(f)
+    
+    print(f"   📦 Registros en JSON: {len(raw_data)}")
+
+    # 3. Procesar datos (Flattening)
+    unique_pois = {}
+    
+    for r in raw_data:
+        if 'place_id' in r:
+            # Recuperar coordenadas (ScrapingDog a veces varía la estructura)
+            lat, lon = None, None
+            
+            # Caso A: Vienen sueltas
+            if 'latitude' in r:
+                lat = safe_float(r.get('latitude'))
+                lon = safe_float(r.get('longitude'))
+            # Caso B: Vienen en objeto gps_coordinates
+            elif 'gps_coordinates' in r:
+                lat = safe_float(r['gps_coordinates'].get('latitude'))
+                lon = safe_float(r['gps_coordinates'].get('longitude'))
+            
+            # FILTRO DE CALIDAD (Solo descartamos si no hay coordenadas)
+            if lat is None or lon is None:
+                continue 
+            
+            # NOTA: He quitado el filtro de Latitud 41-42 (Barcelona) 
+            # para que funcione con Madrid (Lat 40).
+            
+            pid = r['place_id']
+            r['_clean_lat'] = lat
+            r['_clean_lon'] = lon
+            unique_pois[pid] = r
+
+    print(f"   🧹 Registros únicos válidos: {len(unique_pois)}")
+
+    # 4. Preparar DataFrames
+    master_rows = []
+    
+    for pid, r in unique_pois.items():
+        master_rows.append({
+            'place_id': pid,
+            'study_name': STUDY_NAME,          # <--- Nuevo campo importante
+            'snapshot_date': snapshot_date_iso,
+            'title': clean_text_field(r.get('title')),
+            'rating': safe_float(r.get('rating')),
+            'reviews_count': safe_float(r.get('reviews')),
+            'price_level': clean_text_field(r.get('price')),
+            'main_type': clean_text_field(r.get('type')),
+            'address': clean_text_field(r.get('address')),
+            'latitude': r['_clean_lat'],
+            'longitude': r['_clean_lon'],
+            'search_category': clean_text_field(r.get('_scraped_term')), # <--- Mapeo clave
+            'scraped_category': clean_text_field(r.get('_scraped_category')), # Legacy
+            'zip_code': clean_text_field(r.get('zip_code'))
+        })
+
+    df_master = pd.DataFrame(master_rows)
+
+    if df_master.empty:
+        print("⚠️ No hay datos para cargar.")
+        return
+
+    # 5. Carga a Base de Datos (PostGIS Docker)
+    engine = create_engine(DB_CONNECTION_STR)
+    
+    print("💾 Conectando a PostGIS y cargando datos...")
+    
+    try:
+        # Aseguramos que el esquema analytics existe
+        with engine.connect() as conn:
+            conn.execute(text("CREATE SCHEMA IF NOT EXISTS analytics;"))
+            conn.commit()
+
+        # Cargamos la tabla Maestra
+        df_master.to_sql('retail_poi_master', engine, schema='analytics', if_exists='append', index=False, chunksize=500)
+        print(f"   ✅ Insertadas {len(df_master)} filas en 'retail_poi_master'.")
+
+        # 6. Actualización Geométrica (PostGIS Magic)
+        print("🌍 Generando columna de geometría (Puntos en el mapa)...")
+        with engine.connect() as conn:
+            # 1. Añadir columna geom si no existe
+            conn.execute(text(f"""
+                ALTER TABLE {TABLES['master']} 
+                ADD COLUMN IF NOT EXISTS geometry geometry(Point, 4326);
+            """))
+            
+            # 2. Actualizar los puntos nulos de hoy
+            sql_geo = text(f"""
+                UPDATE {TABLES['master']}
+                SET geometry = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326)
+                WHERE geometry IS NULL 
+                  AND snapshot_date = :date
+                  AND study_name = :study
+            """)
+            conn.execute(sql_geo, {'date': snapshot_date_iso, 'study': STUDY_NAME})
+            conn.commit()
+        
+        print("✅ ¡Carga Completa y Geometrías Listas!")
+
+    except Exception as e:
+        print(f"❌ ERROR CRÍTICO DE SQL: {e}")
+
+if __name__ == "__main__":
+    process_and_load()

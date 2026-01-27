@@ -291,3 +291,21 @@ __pycache__/
 EOT
 market_scanner/cache/MADRID_SMART_GRID.json
 etl/final_dataset.csv
+
+
+# Ignorar archivos de datos específicos
+*.csv
+*.CAT
+*.cat
+
+# Ignorar archivos de texto y logs
+*.txt
+watchdog_log.txt
+
+# Ignorar carpetas de datos y caché
+data/
+market_scanner/cache/
+**/__pycache__/
+
+# Ignorar archivos temporales o errores de descarga (como el <!DOCTYPE...)
+market_scanner/<!DOCTYPE*
